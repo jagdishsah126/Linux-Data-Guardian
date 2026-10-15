@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -324,6 +324,63 @@ class Database:
                 "tx_bytes": row["tx_bytes"],
                 "total_bytes": total,
             }
+
+    def get_monthly_usage(
+        self, connection_uuid: Optional[str] = None, billing_cycle_day: int = 1
+    ) -> Dict[str, Any]:
+        """Calculates total usage for the current billing cycle month.
+        If connection_uuid is given, calculates strictly for that network;
+        otherwise aggregates all networks.
+        """
+        today = date.today()
+        # Compute start date based on billing cycle day
+        cycle_day = max(1, min(int(billing_cycle_day), 28))
+        if today.day >= cycle_day:
+            start_date = today.replace(day=cycle_day)
+        else:
+            prev_month_last = today.replace(day=1) - timedelta(days=1)
+            start_date = prev_month_last.replace(day=cycle_day)
+
+        start_str = start_date.isoformat()
+        end_str = today.isoformat()
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if connection_uuid:
+                cursor.execute("""
+                    SELECT COALESCE(SUM(rx_bytes), 0) AS total_rx,
+                           COALESCE(SUM(tx_bytes), 0) AS total_tx,
+                           COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+                    FROM network_daily_usage
+                    WHERE connection_uuid = ?
+                      AND date >= ? AND date <= ?;
+                """, (connection_uuid, start_str, end_str))
+                row = cursor.fetchone()
+                return {
+                    "start_date": start_str,
+                    "end_date": end_str,
+                    "connection_uuid": connection_uuid,
+                    "rx_bytes": row["total_rx"] if row else 0,
+                    "tx_bytes": row["total_tx"] if row else 0,
+                    "total_bytes": row["total_bytes"] if row else 0,
+                }
+            else:
+                cursor.execute("""
+                    SELECT COALESCE(SUM(rx_bytes), 0) AS total_rx,
+                           COALESCE(SUM(tx_bytes), 0) AS total_tx,
+                           COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+                    FROM daily_usage
+                    WHERE date >= ? AND date <= ?;
+                """, (start_str, end_str))
+                row = cursor.fetchone()
+                return {
+                    "start_date": start_str,
+                    "end_date": end_str,
+                    "connection_uuid": None,
+                    "rx_bytes": row["total_rx"] if row else 0,
+                    "tx_bytes": row["total_tx"] if row else 0,
+                    "total_bytes": row["total_bytes"] if row else 0,
+                }
 
     def get_network_history(
         self, connection_uuid: str, days: int = 60

@@ -1,20 +1,27 @@
-# ============================================================
-# Linux Data Guardian — Permanent System Installation Notes
-# Run the SUDO commands below manually in your terminal.
-# ============================================================
+# ==============================================================================
+# Linux Data Guardian — Secure Sudo Installation Steps
+# ==============================================================================
+# Run these commands manually in your terminal when ready.
+# They install the root-owned privileged helper and targeted sudoers permissions,
+# and remove the old unsafe APT hook.
+# ==============================================================================
 
-# STEP 1: Copy icon system-wide (so it shows in status bar)
-#   sudo cp /home/jagdish/Desktop/System\ Files/Linux\ Data\ Guardian/wifi.png \
-#       /usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png
-#   sudo gtk-update-icon-cache /usr/share/icons/hicolor
+# 1. Install the root-owned privileged helper script
+sudo mkdir -p /usr/local/libexec
+sudo cp "/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/data-guardian-helper" /usr/local/libexec/data-guardian-helper
+sudo chown root:root /usr/local/libexec/data-guardian-helper
+sudo chmod 0755 /usr/local/libexec/data-guardian-helper
 
-# STEP 2: Install APT download gating hook (blocks apt installs on metered data)
-#   sudo cp /home/jagdish/Desktop/System\ Files/Linux\ Data\ Guardian/config/apt-hook-template.conf \
-#       /etc/apt/apt.conf.d/99data-guardian
+# 2. Install targeted sudoers configuration (allows ONLY data-guardian-helper)
+sudo cp "/home/jagdish/Desktop/System Files/Linux Data Guardian/config/sudoers-data-guardian" /etc/sudoers.d/linux-data-guardian
+sudo chown root:root /etc/sudoers.d/linux-data-guardian
+sudo chmod 0440 /etc/sudoers.d/linux-data-guardian
 
-# STEP 3: Install the systemd background daemon (auto-starts at login)
-#   sudo cp /home/jagdish/Desktop/System\ Files/Linux\ Data\ Guardian/systemd/data-guardian.service \
-#       /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable data-guardian.service
-#   sudo systemctl start data-guardian.service
+# 3. Remove the legacy root APT execution hook (replaced by kernel-level UID 42 isolation)
+sudo rm -f /etc/apt/apt.conf.d/99data-guardian
+
+# 4. Restart the background daemon service
+sudo systemctl restart data-guardian.service
+
+# 5. Verify the helper is functioning cleanly
+sudo -n /usr/local/libexec/data-guardian-helper --status

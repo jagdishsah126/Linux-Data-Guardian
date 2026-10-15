@@ -112,22 +112,26 @@ CLI_COMMANDS = [
                 "desc": "Temporarily grant 500 MB extra on top of today's daily quota limit.",
             },
             {
+                "label": "Allow APT Updates (15 min)",
+                "cmd": "data-guardian allow-apt",
+                "desc": "Opens a temporary 15-minute window for APT package updates (sudo apt update / install) on mobile data without disabling other protections.",
+            },
+            {
                 "label": "Emergency Bypass (All Off)",
                 "cmd": "data-guardian bypass",
                 "desc": "EMERGENCY: Immediately disables all firewall rules and removes nft data_guardian table. "
                         "Use if you are accidentally locked out of a network.",
-            },
-            {
-                "label": "Test APT Hook (Dry Run)",
-                "cmd": "apt-get install --dry-run curl 2>&1",
-                "desc": "Simulates an apt install to verify the download approval gate hook is active. "
-                        "If on hotspot, a Zenity prompt should appear asking for approval.",
             },
         ],
     },
     {
         "group": "🔧 Installation & Maintenance",
         "commands": [
+            {
+                "label": "Check Privileged Helper",
+                "cmd": "sudo -n /usr/local/libexec/data-guardian-helper --status 2>&1 || echo 'Helper inactive or not yet installed with sudo'",
+                "desc": "Tests if the root-owned privileged helper is installed and accessible via passwordless sudo.",
+            },
             {
                 "label": "Install Shims (pip/npm/cargo)",
                 "cmd": "data-guardian install-shims",
@@ -300,10 +304,14 @@ class DashboardWindow(Gtk.Window):
         btn_100.connect("clicked", lambda b: self._grant_allowance(100))
         btn_500 = Gtk.Button(label="+500 MB")
         btn_500.connect("clicked", lambda b: self._grant_allowance(500))
-        btn_bypass = Gtk.Button(label="🚨 Emergency Bypass")
+        btn_apt = Gtk.Button(label="📦 Allow APT")
+        btn_apt.set_tooltip_text("Open a temporary 15-minute window for apt update / apt install on mobile data")
+        btn_apt.connect("clicked", lambda b: self._allow_apt_window())
+        btn_bypass = Gtk.Button(label="🚨 Bypass")
         btn_bypass.connect("clicked", self._emergency_bypass)
         btn_box.pack_start(btn_100, True, True, 0)
         btn_box.pack_start(btn_500, True, True, 0)
+        btn_box.pack_start(btn_apt, True, True, 0)
         btn_box.pack_start(btn_bypass, True, True, 0)
         usage_box.pack_start(btn_box, False, False, 4)
 
@@ -318,7 +326,7 @@ class DashboardWindow(Gtk.Window):
 
         profile_radio_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.radio_balanced = Gtk.RadioButton.new_with_label_from_widget(None, "⚖️  Balanced")
-        self.radio_strict = Gtk.RadioButton.new_with_label_from_widget(self.radio_balanced, "🔒  Strict")
+        self.radio_strict = Gtk.RadioButton.new_with_label_from_widget(self.radio_balanced, "🔒  Strict (Exp.)")
         self.radio_off = Gtk.RadioButton.new_with_label_from_widget(self.radio_balanced, "👁  Off (Monitor Only)")
         self.radio_balanced.connect("toggled", lambda b: self._on_profile_toggled("balanced", b.get_active()))
         self.radio_strict.connect("toggled", lambda b: self._on_profile_toggled("strict", b.get_active()))
@@ -361,9 +369,9 @@ class DashboardWindow(Gtk.Window):
             )
         elif profile == "strict":
             return (
-                "<small><span foreground='#1565c0'>🔒  <b>Strict</b>: Only the app you are currently "
-                "using gets network access. All other apps are firewalled. "
-                "Maximum data saving — use when data is very limited.</span></small>"
+                "<small><span foreground='#1565c0'>🔒  <b>Strict (Experimental)</b>: In this stage, "
+                "background updates are silenced while cgroup process hierarchy tracking is being stabilized. "
+                "Safe, maximum background data saving.</span></small>"
             )
         else:
             return (
@@ -485,6 +493,10 @@ class DashboardWindow(Gtk.Window):
 
     def _grant_allowance(self, mb: int) -> None:
         send_ipc_command({"action": "grant_allowance", "mb": mb})
+        GLib.timeout_add(500, self._refresh_overview)
+
+    def _allow_apt_window(self) -> None:
+        resp = send_ipc_command({"action": "allow_apt_window"})
         GLib.timeout_add(500, self._refresh_overview)
 
     def _emergency_bypass(self, _widget: Gtk.Widget) -> None:

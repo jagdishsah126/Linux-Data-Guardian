@@ -19,8 +19,8 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(self.db_path.exists())
         with self.db._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT version FROM schema_version;")
-            self.assertEqual(cursor.fetchone()[0], 1)
+            cursor.execute("SELECT MAX(version) FROM schema_version;")
+            self.assertEqual(cursor.fetchone()[0], 2)
 
     def test_session_lifecycle(self):
         session_id = self.db.start_session("uuid-1234", "NTC Hotspot", "wlp0s20f3", "balanced")
@@ -75,6 +75,26 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(len(recent), 1)
         self.assertEqual(recent[0]["tool"], "apt")
         self.assertEqual(recent[0]["decision"], "approved")
+
+    def test_monthly_usage_and_per_network_tracking(self):
+        # Record delta for specific network
+        res = self.db.record_usage_delta(
+            delta_rx=1024 * 1024,
+            delta_tx=512 * 1024,
+            connection_uuid="uuid-hotspot-test",
+            connection_name="Test Hotspot"
+        )
+        self.assertGreaterEqual(res["total_bytes"], 1536 * 1024)
+
+        # Query per-network today usage
+        net_today = self.db.get_network_today_usage("uuid-hotspot-test")
+        self.assertEqual(net_today["connection_name"], "Test Hotspot")
+        self.assertEqual(net_today["rx_bytes"], 1024 * 1024)
+        self.assertEqual(net_today["tx_bytes"], 512 * 1024)
+
+        # Query monthly usage
+        monthly = self.db.get_monthly_usage(connection_uuid="uuid-hotspot-test", billing_cycle_day=1)
+        self.assertEqual(monthly["total_bytes"], 1536 * 1024)
 
 
 if __name__ == "__main__":

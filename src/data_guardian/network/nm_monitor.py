@@ -118,11 +118,11 @@ class NetworkMonitor:
         if not active:
             return False
 
-        if self.designated_uuid and active.uuid == self.designated_uuid:
-            return True
+        if self.designated_uuid:
+            return active.uuid == self.designated_uuid
 
-        if self.designated_name and active.name.lower() == self.designated_name.lower():
-            return True
+        if self.designated_name:
+            return active.name.lower() == self.designated_name.lower()
 
         return False
 
@@ -138,9 +138,10 @@ class NetworkMonitor:
         active = self.get_active_connection()
         is_now_hotspot = False
         if active:
-            if (self.designated_uuid and active.uuid == self.designated_uuid) or \
-               (self.designated_name and active.name.lower() == self.designated_name.lower()):
-                is_now_hotspot = True
+            if self.designated_uuid:
+                is_now_hotspot = (active.uuid == self.designated_uuid)
+            elif self.designated_name:
+                is_now_hotspot = (active.name.lower() == self.designated_name.lower())
 
         # Transition into designated hotspot
         if is_now_hotspot and not self._is_hotspot_active:

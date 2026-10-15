@@ -133,6 +133,7 @@ def main() -> None:
     p_allow.add_argument("mb", type=int, help="Megabytes to add")
 
     subparsers.add_parser("bypass", help="Emergency disable all restrictions")
+    subparsers.add_parser("allow-apt", help="Temporarily allow APT downloads while on metered hotspot")
     subparsers.add_parser("install-shims", help="Install CLI shims for pip, npm, cargo in ~/.local/bin")
     subparsers.add_parser("remove-shims", help="Remove CLI shims")
 
@@ -168,6 +169,13 @@ def main() -> None:
             db = Database(ConfigManager().db_path)
             db.grant_temporary_allowance(args.mb * 1024 * 1024)
             print(f"[+] Granted +{args.mb} MB in database.")
+    elif args.command == "allow-apt":
+        resp = send_ipc_command({"action": "allow_apt_window"})
+        if resp and resp.get("status") == "ok":
+            print("[+] Successfully opened APT download window. You can now run 'sudo apt update' or 'sudo apt install'.")
+        else:
+            msg = resp.get("message") if resp else "Daemon offline"
+            print(f"[-] Could not open APT window: {msg}")
     elif args.command == "bypass":
         send_ipc_command({"action": "emergency_bypass"})
         # Also run emergency recovery script

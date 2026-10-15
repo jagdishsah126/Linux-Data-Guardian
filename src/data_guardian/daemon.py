@@ -38,6 +38,21 @@ class DataGuardianDaemon:
         self._is_quota_blocked: bool = False
         self._active_app_name: str = "unknown"
 
+        # Quota-state recovery on startup: check if today or this month already exceeded limits
+        today_usage = self.db.get_today_usage()
+        daily_limit = self.config_mgr.daily_limit_mb * 1024 * 1024
+        monthly_limit = self.config_mgr.monthly_limit_mb * 1024 * 1024
+        billing_day = self.config_mgr.config.get("quotas", {}).get("billing_cycle_day", 1)
+        monthly_usage = self.db.get_monthly_usage(
+            connection_uuid=self.config_mgr.designated_hotspot_uuid or None,
+            billing_cycle_day=billing_day
+        )
+        is_daily_exceeded = (daily_limit > 0 and today_usage.get("total_bytes", 0) >= today_usage.get("effective_limit_bytes", daily_limit))
+        is_monthly_exceeded = (monthly_limit > 0 and monthly_usage.get("total_bytes", 0) >= monthly_limit)
+        if is_daily_exceeded or is_monthly_exceeded:
+            self._is_quota_blocked = True
+            print("[!] Quota limit already exceeded on startup. Enforcing quota-blocked state.")
+
     def start(self) -> None:
         """Starts daemon loops and signal handlers."""
         self._is_running = True
@@ -84,6 +99,10 @@ class DataGuardianDaemon:
     def _on_hotspot_activated(self, conn: ConnectionInfo) -> None:
         """Called when connected to the designated metered hotspot."""
         print(f"[+] Hotspot activated: {conn.name} ({conn.uuid}) on {conn.interface}")
+        # Apply per-network profile if saved, fallback to default
+        saved_profile = self.config_mgr.get_network_profile(conn.uuid)
+        self._current_profile = saved_profile
+
         self._active_session_id = self.db.start_session(
             connection_uuid=conn.uuid,
             connection_name=conn.name,
@@ -94,7 +113,13 @@ class DataGuardianDaemon:
 
         # Apply profile firewall rules
         if self._current_profile != "off":
-            self.firewall.apply_profile(self._current_profile, quota_exceeded=self._is_quota_blocked)
+            success, msg = self.firewall.apply_profile(
+                self._current_profile,
+                interface=conn.interface,
+                quota_exceeded=self._is_quota_blocked
+            )
+            if not success:
+                print(f"[!] Warning: Firewall rule application failed: {msg}")
 
         self._notify(
             "Linux Data Guardian Active",
@@ -135,8 +160,8 @@ class DataGuardianDaemon:
         if win_info:
             self._active_app_name = win_info.app_name
 
-        # 3. If connected to metered hotspot, calculate usage and check quotas
-        if is_hotspot and active_conn.interface:
+        # 3. Calculate usage across active interface
+        if active_conn.interface:
             delta_rx, delta_tx, speed = self.byte_counter.get_delta(active_conn.interface)
 
             if delta_rx > 0 or delta_tx > 0:
@@ -144,16 +169,18 @@ class DataGuardianDaemon:
                 if self._active_session_id:
                     self.db.update_session(self._active_session_id, delta_rx, delta_tx)
 
-                # Daily quota calculation
-                daily_limit_bytes = self.config_mgr.daily_limit_mb * 1024 * 1024
+                # Daily quota calculation: quota limit is applied if connected to metered hotspot
+                daily_limit_bytes = (self.config_mgr.daily_limit_mb * 1024 * 1024) if is_hotspot else 0
                 usage = self.db.record_usage_delta(
                     delta_rx=delta_rx,
                     delta_tx=delta_tx,
-                    quota_limit_bytes=daily_limit_bytes
+                    quota_limit_bytes=daily_limit_bytes,
+                    connection_uuid=active_conn.uuid,
+                    connection_name=active_conn.name,
                 )
 
-                # Warning threshold check (e.g. 80%)
-                if usage and usage.get("quota_limit_bytes", 0) > 0:
+                # Quota evaluation occurs only when on designated metered hotspot
+                if is_hotspot and usage and usage.get("quota_limit_bytes", 0) > 0:
                     effective_limit = usage["effective_limit_bytes"]
                     total = usage["total_bytes"]
                     percent = (total / effective_limit) * 100 if effective_limit > 0 else 0
@@ -162,19 +189,37 @@ class DataGuardianDaemon:
                     if percent >= warning_pct and not usage.get("warning_fired", False):
                         self.db.set_warning_fired()
                         self._notify(
-                            "Data Warning (80% Reached)",
+                            f"Data Warning ({warning_pct}% Reached)",
                             f"You have used {format_bytes(total)} of today's {format_bytes(effective_limit)} budget.",
                             urgency="critical"
                         )
 
-                    # Quota exhaustion check
-                    if usage.get("quota_exceeded", False) and not self._is_quota_blocked:
+                    # Daily quota exhaustion check
+                    daily_exceeded = usage.get("quota_exceeded", False)
+
+                    # Monthly quota exhaustion check
+                    monthly_limit_bytes = self.config_mgr.monthly_limit_mb * 1024 * 1024
+                    billing_day = self.config_mgr.config.get("quotas", {}).get("billing_cycle_day", 1)
+                    monthly_usage = self.db.get_monthly_usage(
+                        connection_uuid=self.config_mgr.designated_hotspot_uuid or None,
+                        billing_cycle_day=billing_day
+                    )
+                    monthly_total = monthly_usage.get("total_bytes", 0)
+                    monthly_exceeded = (monthly_limit_bytes > 0 and monthly_total >= monthly_limit_bytes)
+
+                    if (daily_exceeded or monthly_exceeded) and not self._is_quota_blocked:
                         self._is_quota_blocked = True
+                        reason = "Monthly" if monthly_exceeded else "Daily"
+                        limit_str = format_bytes(monthly_limit_bytes if monthly_exceeded else effective_limit)
                         if self.config_mgr.config.get("quotas", {}).get("action_on_exhaustion") == "block_unapproved":
-                            self.firewall.apply_profile(self._current_profile, quota_exceeded=True)
+                            self.firewall.apply_profile(
+                                self._current_profile,
+                                interface=active_conn.interface,
+                                quota_exceeded=True
+                            )
                         self._notify(
-                            "Daily Data Quota Exhausted!",
-                            f"Daily limit of {format_bytes(effective_limit)} reached. Further unapproved outbound traffic is paused.",
+                            f"{reason} Data Quota Exhausted!",
+                            f"{reason} limit of {limit_str} reached. Further unapproved outbound traffic is paused.",
                             urgency="critical"
                         )
 
@@ -186,6 +231,11 @@ class DataGuardianDaemon:
             today_usage = self.db.get_today_usage()
             active_conn = self.monitor.get_active_connection()
             is_hotspot = self.monitor.is_designated_hotspot_active()
+            billing_day = self.config_mgr.config.get("quotas", {}).get("billing_cycle_day", 1)
+            monthly_usage = self.db.get_monthly_usage(
+                connection_uuid=self.config_mgr.designated_hotspot_uuid or None,
+                billing_cycle_day=billing_day
+            )
             return {
                 "status": "ok",
                 "is_hotspot_active": is_hotspot,
@@ -198,6 +248,8 @@ class DataGuardianDaemon:
                 "today_tx": today_usage.get("tx_bytes", 0),
                 "today_total": today_usage.get("total_bytes", 0),
                 "daily_limit_bytes": today_usage.get("effective_limit_bytes", 0),
+                "monthly_total": monthly_usage.get("total_bytes", 0),
+                "monthly_limit_bytes": self.config_mgr.monthly_limit_mb * 1024 * 1024,
                 "active_app": self._active_app_name,
             }
 
@@ -206,8 +258,13 @@ class DataGuardianDaemon:
             if new_profile in ("balanced", "strict", "off"):
                 self._current_profile = new_profile
                 self.config_mgr.active_profile = new_profile
+                active_conn = self.monitor.get_active_connection()
                 if self.monitor.is_designated_hotspot_active():
-                    self.firewall.apply_profile(new_profile, quota_exceeded=self._is_quota_blocked)
+                    self.firewall.apply_profile(
+                        new_profile,
+                        interface=(active_conn.interface if active_conn else ""),
+                        quota_exceeded=self._is_quota_blocked
+                    )
                 return {"status": "ok", "profile": new_profile}
             return {"status": "error", "message": "Invalid profile"}
 
@@ -216,10 +273,21 @@ class DataGuardianDaemon:
             allowance_bytes = mb * 1024 * 1024
             self.db.grant_temporary_allowance(allowance_bytes)
             self._is_quota_blocked = False
+            active_conn = self.monitor.get_active_connection()
             if self.monitor.is_designated_hotspot_active():
-                self.firewall.apply_profile(self._current_profile, quota_exceeded=False)
+                self.firewall.apply_profile(
+                    self._current_profile,
+                    interface=(active_conn.interface if active_conn else ""),
+                    quota_exceeded=False
+                )
             self._notify("Data Allowance Granted", f"Added +{mb} MB to today's quota.", urgency="normal")
             return {"status": "ok", "added_mb": mb}
+
+        elif action == "allow_apt_window":
+            active_conn = self.monitor.get_active_connection()
+            iface = active_conn.interface if active_conn else ""
+            ok, msg = self.firewall.open_apt_window(iface)
+            return {"status": "ok" if ok else "error", "message": msg}
 
         elif action == "emergency_bypass":
             self.firewall.flush()

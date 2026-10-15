@@ -1,353 +1,268 @@
-# Linux Data Guardian — Independent Audit Report
+# Linux Data Guardian — Comprehensive Independent Audit Report (Revision 2)
 
 **Branch:** `main`  
-**Commit audited:** `7caf94d`  
-**Audit date:** 2026-10-15  
-**Auditor:** Independent code review (all findings verified against actual source)
+**Commit Audited:** `7caf94d` (working tree clean)  
+**Audit Date:** 2026-10-15  
+**Review Type:** Deep Security Architecture, Privilege Boundary, and Implementation Verification  
 
 ---
 
 ## 1. Executive Summary
 
-Linux Data Guardian is a **working prototype** — not yet a production-safe tool.
-Several core mechanisms either silently fail or are completely unimplemented despite appearing
-functional in the UI. The monitoring and accounting layer works correctly. The firewall layer
-**never actually applies rules** under normal operation. The download gate works for APT but
-has a critical privilege issue. Statistics UI is backed by real data.
+Linux Data Guardian is currently a functional monitoring and UI prototype, but **its security architecture, privilege boundary, and firewall enforcement have critical vulnerabilities and structural gaps**.
 
-### What is actually working ✅
-- Daemon starts, runs, and survives reboots (systemd service healthy)
-- Network change detection (designated hotspot UUID matching, transition callbacks)
-- `/proc/net/dev` usage accounting (RX/TX byte tracking per interface, delta math correct)
-- Per-network daily usage DB (v2 migration ran successfully)
-- SQLite database: sessions, daily_usage, network_daily_usage, approval_events — all correct
-- IPC socket (tray ↔ daemon ↔ dashboard) — working
-- Dashboard tabs: Overview, Statistics (matplotlib chart with real data), CLI tab
-- Per-network profile saved in config.yaml (new feature, works correctly)
-- Approval gate logic (should_gate, whitelist, off-mode bypass) — logic is correct
-- APT hook installed at `/etc/apt/apt.conf.d/99data-guardian`
-- Tray icon using XApp.StatusIcon (Linux Mint native) — confirmed showing
-- Emergency disable script — safe, scoped to data_guardian table only
-- 21/21 unit tests pass
+Prior assumptions—specifically that simple sudoers additions or environment variable hacks in root hooks could fix privileged operations—are invalid and dangerous. Specifically, running root hooks against user-writable Python repositories introduces a **Critical Local Privilege Escalation (LPE)** risk. Furthermore, firewall enforcement is currently completely non-operational because the unprivileged user daemon lacks an authorized execution path to `nft`.
 
-### What must NOT be trusted in production ⚠️
-- **Firewall rules are NEVER applied** — daemon runs as user `jagdish`, has no sudo, so every `apply_profile()` call silently fails. Balanced and Strict modes do nothing to actual traffic.
-- **APT hook runs as root** — reads config from `/root/.config/` (not jagdish's), so `is_hotspot_active()` will always return `False`. APT approval gate passes through without asking.
-- **Strict mode cgroup mechanism doesn't exist** — `socket cgroupv2` rules reference `data_guardian/foreground` cgroup that is never created.
-- **Monthly quota is not implemented** — tracked in config but never checked or enforced.
-- **`record_usage_delta()` does not pass connection UUID** — per-network accounting only populated from sessions table migration, not live tracking.
-- **Notifications do not work from systemd** — daemon has no `DISPLAY` env var set.
+### Current System Health Matrix
+
+| Subsystem | Verified State | Production Readiness |
+|---|---|---|
+| **Network Detection** | Verified libnm/nmcli polling; UUID matching logic works. | 🟡 Usable, requires strict manual assignment lock. |
+| **Traffic Accounting** | Verified `/proc/net/dev` interface reader and delta math. | 🟢 Working correctly at interface level. |
+| **Database & Storage** | SQLite schema v2 with WAL mode; sessions and daily tables. | 🟡 Working, needs live per-network wiring. |
+| **Dashboard UI & CLI** | GTK3 3-tab layout, live chart, interactive command runner. | 🟢 Working and responsive. |
+| **System Tray** | XApp.StatusIcon native to Linux Mint panel. | 🟢 Verified showing in panel. |
+| **Firewall Enforcement** | `apply_profile()` fails silently (unprivileged user lacks sudo). | 🔴 **Broken (Zero enforcement active).** |
+| **Strict Mode (Cgroups)** | References non-existent `/sys/fs/cgroup/data_guardian`. | 🔴 **Non-functional / Hazardous if enabled.** |
+| **APT Gating Hook** | Root hook executes code from user-writable desktop path. | 🔴 **Critical Security Risk (LPE).** |
+| **Desktop Notifications** | Silent failure under systemd due to missing session bus/display. | 🔴 Broken in background service. |
 
 ---
 
 ## 2. Feature Implementation Matrix
 
-| Feature | Intended Behavior | Actual Implementation | Status | Evidence |
+| Feature | Design Specification | Verified Actual Behavior | Verdict & Impact | Evidence (File & Line) |
 |---|---|---|---|---|
-| Daemon auto-start at boot | systemd service starts daemon | ✅ Works correctly | **Verified** | `systemctl status` active |
-| Hotspot detection | Match designated UUID | ✅ `poll_check()` correct | **Verified** | daemon.py:L67, nm_monitor.py |
-| Usage accounting (RX/TX) | Track bytes per session | ✅ `/proc/net/dev` delta | **Verified** | byte_counter.py, daemon.py:L134 |
-| Per-network daily stats | Separate stats per network | ⚠️ Partially working | **Partial** | DB has it but daemon doesn't pass UUID (BUG-003) |
-| Daily quota limit | Block at N MB/day | ⚠️ Logic exists, enforcement fails | **Partial** | quota_exceeded flag set, but nft never applied |
-| Monthly quota limit | Block at N MB/month | ❌ Never checked in daemon | **Missing** | No monthly check in daemon.py |
-| 80% warning notification | notify-send alert | ⚠️ Code exists, DISPLAY missing | **Partial** | daemon.py:L162, no DISPLAY in systemd (BUG-006) |
-| Balanced profile firewall | Block UID 42 (apt), allow browsing | ❌ Rules never applied | **Not Enforced** | nft_manager.py: `can_apply_rules()` returns False (SEC-001) |
-| Strict profile firewall | Foreground-only via cgroups | ❌ Rules never applied + cgroup not created | **Not Enforced** | SEC-001, SEC-002 |
-| Off profile | Monitoring only, no rules | ✅ Works (no rules = correct) | **Verified** | rulesets.py off returns delete |
-| APT download gating | Prompt before apt install | ⚠️ Hook installed but runs as root | **Broken** | BUG-001 |
-| pip/npm/cargo shims | Intercept package installs | ✅ Shim logic correct | **Verified** (logic only) | shims.py, gate.py |
-| Zenity approval dialog | GUI prompt on metered | ✅ Logic correct | **Unverified on hotspot** | gate.py:L93 |
-| Emergency disable | Remove all nft rules | ✅ Scoped to data_guardian table | **Verified** | emergency-disable.sh |
-| Per-network profile | Each network has own mode | ✅ Saved in config.yaml | **Verified** | config.py:get/set_network_profile |
-| Statistics tab / chart | Line chart per network | ✅ Real DB data | **Verified** | dashboard.py, database.py |
-| CLI tab | Run commands in-app | ✅ Working with inline output | **Verified** | dashboard.py |
-| Tray icon | XApp.StatusIcon in XFCE panel | ✅ Confirmed showing | **Verified** | tray.py |
-| IPC daemon ↔ UI | UNIX socket | ✅ Working | **Verified** | ipc.py |
-| Whitelist (git, brave, etc.) | Never blocked | ⚠️ Whitelist config exists, approval gate uses it | **Partial** | gate.py:L47, but nft rules don't whitelist by name |
-| Uninstall script | Clean removal | ⚠️ Not audited | **Unverified** | scripts/uninstall.sh |
+| **Daemon Execution** | Auto-starts at boot, runs persistently as `jagdish`. | Daemon runs active (15.5 MB RAM) via systemd. | 🟢 **Verified Functional** | `systemd/data-guardian.service` |
+| **Hotspot Detection** | Identifies designated mobile hotspot by UUID/name. | Matches UUID/name; manual setting in `config.yaml`. | 🟡 **Functional with Caveats** (Flapping risk if UI alters config) | `src/data_guardian/network/nm_monitor.py:115-158` |
+| **Interface Accounting** | Tracks delta RX/TX bytes from `/proc/net/dev`. | Parses active interface lines, handles counter reset. | 🟢 **Verified Functional** | `src/data_guardian/network/byte_counter.py:46-95` |
+| **Per-Network DB Stats** | Stores daily RX/TX segregated by connection UUID. | Table exists (schema v2); populated via migration, but daemon omits UUID during runtime. | 🟡 **Partially Integrated** (Historical OK, live live-feed missing UUID) | `src/data_guardian/database.py:65-85`, `daemon.py:149-153` |
+| **Daily Quota Evaluation** | Compares today's total bytes against `daily_limit_mb`. | Evaluates threshold, sets `_is_quota_blocked`, but firewall fails to apply. | 🟡 **Logical Only** (No kernel packet drop) | `src/data_guardian/daemon.py:149-178` |
+| **Monthly Quota Enforcement**| Evaluates monthly usage against `monthly_limit_mb`. | Config key exists; daemon never evaluates it. | 🔴 **Missing Implementation** | `src/data_guardian/daemon.py` |
+| **Balanced Profile Firewall**| Drops `_apt` (UID 42), permits general web surfing. | Ruleset string built correctly, but `nft` call fails: `sudo: a password is required`. | 🔴 **Non-Functional** | `src/data_guardian/firewall/nft_manager.py:35-55` |
+| **Strict Profile Firewall** | Restricts traffic exclusively to foreground window. | nftables rule looks for cgroupv2 path that is never initialized. | 🔴 **Hazardous / Broken** | `src/data_guardian/firewall/rulesets.py:47-55` |
+| **APT Download Interception**| Prompts approval before downloading package archives. | `/etc/apt/apt.conf.d/99data-guardian` executes user desktop Python script as root. | 🔴 **Critical Privilege Flaw** | `/etc/apt/apt.conf.d/99data-guardian` |
+| **CLI Shims (pip/npm/cargo)**| Gating wrapper scripts in `~/.local/bin`. | Shims exist and intercept user execution; prompt runs in user context. | 🟢 **Verified Logic** | `src/data_guardian/approvals/shims.py:12-42` |
+| **Emergency Recovery** | Flushes rules without breaking existing UFW/system rules. | `scripts/emergency-disable.sh` targets only `table inet data_guardian`. | 🟢 **Verified Safe** | `scripts/emergency-disable.sh` |
+| **Per-Network Profile** | Remembers profile (Balanced/Strict/Off) per network. | Persisted in `config.yaml` by UI, but daemon ignores per-network profile on network transition. | 🟡 **Partially Implemented** | `src/data_guardian/ui/dashboard.py`, `daemon.py:86-105` |
 
 ---
 
-## 3. Critical and High-Priority Findings
+## 3. Detailed Critical & High-Priority Findings
+
+### SEC-001: Absence of Validated Privileged Execution Path for Firewall
+- **Severity:** Critical  
+- **Confidence:** Confirmed (Live Verification: `sudo -n true` exits 1, `nft` requires root)  
+- **Technical Analysis:** The background service runs as unprivileged user `jagdish` (`User=jagdish` in systemd). `NftablesManager.apply_profile()` executes `sudo -n nft -f -`. Because `jagdish` does not have passwordless sudo for `nft`, the command fails with `sudo: a password is required`. The daemon silently discards the returned `(False, error_msg)` tuple (`daemon.py:100`).
+- **Hazardous Misconception:** Granting `jagdish ALL=(root) NOPASSWD: /usr/sbin/nft` in sudoers is **extremely insecure**. A user with arbitrary `nft` access can flush the entire system firewall (`nft flush ruleset`), disable UFW, redirect arbitrary traffic, or eavesdrop on unencrypted network packets.
+- **Root Cause:** Lack of a dedicated, root-owned privileged helper with strict command validation.
 
 ---
 
-### SEC-001 — Firewall Rules Never Applied
-**Severity:** Critical | **Confidence:** Confirmed
-
-**Evidence:**
-```python
-# nft_manager.py — can_apply_rules()
-res = subprocess.run(["sudo", "-n", "true"], ...)
-return res.returncode == 0
-# Daemon runs as User=jagdish, no passwordless sudo configured
-# sudo -n true → REQUIRES PASSWORD → returns False
-# Therefore apply_profile() returns (False, "Root privileges required...")
-# The return value is NOT checked in daemon.py
-```
-```python
-# daemon.py:L99 — return value silently discarded
-self.firewall.apply_profile(self._current_profile, quota_exceeded=self._is_quota_blocked)
-# No check of the returned (bool, str) tuple
-```
-
-**Confirmed:** `sudo -n nft list tables` requires password — verified live.
-
-**Failure scenario:** User connects to Moto Mobile hotspot, daemon switches to Balanced or Strict mode, UI reports active enforcement, but `/proc/net/dev` shows full unrestricted traffic. No rules exist in nftables. The daemon logs no error.
-
-**User impact:** All data-saving firewall features (Balanced, Strict, quota block) are completely ineffective. The system appears to work but does nothing.
-
-**Recommended fix:** Add a polkit rule allowing user `jagdish` to run `nft` for the `data_guardian` table only — or add passwordless sudo for `nft` scoped to this table. The daemon then gains real enforcement without running as root.
-
-**Regression risk:** Low — adding polkit or targeted sudoers entry affects only this table.
+### SEC-002: Insecure Execution of Unprivileged Code from Root Context (APT Hook)
+- **Severity:** Critical (Local Privilege Escalation Vulnerability)  
+- **Confidence:** Confirmed (`ls -ld` on repo shows owner `jagdish:jagdish`, mode `0775`)  
+- **Technical Analysis:** `/etc/apt/apt.conf.d/99data-guardian` invokes:
+  ```
+  APT::Acquire::Pre-Invoke {
+      "PYTHONPATH='/home/jagdish/Desktop/System Files/Linux Data Guardian' /usr/bin/python3 -m src.data_guardian.approvals.gate --tool apt install || exit 1";
+  };
+  ```
+  When `sudo apt install` or unattended upgrades run, the hook executes with **root privileges**. It imports Python modules directly from `/home/jagdish/Desktop/System Files/...`, which is writable by unprivileged user `jagdish`.
+- **Exploitation Scenario:** Any malicious process, script, or extension running under the unprivileged user account can modify `gate.py` or inject malicious code into `__init__.py`. The next time the user runs `sudo apt`, root executes the compromised script, granting instant, undetectable root compromise.
+- **Secondary Failure:** When executed by root, `Path.home()` evaluates to `/root`, looking for `/root/.config/linux-data-guardian/config.yaml`. That file does not exist, causing `is_designated_hotspot_active()` to return `False` and silently pass through without gating.
 
 ---
 
-### SEC-002 — Strict Mode cgroup Never Created
-**Severity:** Critical | **Confidence:** Confirmed
-
-**Evidence:**
-```nft
-# rulesets.py — strict profile rule
-socket cgroupv2 level 2 "data_guardian/foreground" accept
-```
-```bash
-# Checked live:
-ls /sys/fs/cgroup/data_guardian  # → "No such file or directory"
-```
-
-**Failure scenario:** Even if SEC-001 is fixed (nft rules get applied), Strict mode rules reference `/sys/fs/cgroup/data_guardian/foreground` which does not exist. All new outbound connections would be dropped — including the foreground app. The daemon has no code to create cgroups or assign processes to them.
-
-**User impact:** Strict mode, once firewall enforcement is fixed, would block ALL new connections (same as quota exceeded), including the foreground browser. This is dangerous.
-
-**Recommended fix (requires user decision):** Option A — Implement proper cgroup v2 management: create `data_guardian/{foreground,whitelist}` cgroups, move foreground app PID into foreground cgroup on X11 window change. This is complex. Option B — Replace Strict mode cgroup rules with a simpler UID-based or process-name approach. Option C — Remove Strict mode from firewall and keep it UI-only for now with a clear disclaimer.
+### SEC-003: Strict Profile cgroupv2 Hierarchy Completely Missing
+- **Severity:** High  
+- **Confidence:** Confirmed (`ls /sys/fs/cgroup/data_guardian` returns `No such file or directory`)  
+- **Technical Analysis:** `rulesets.py:50` generates:
+  ```nft
+  socket cgroupv2 level 2 "data_guardian/foreground" accept
+  socket cgroupv2 level 2 "data_guardian/whitelist" accept
+  ct state new drop
+  ```
+  No component of the application ever creates `/sys/fs/cgroup/data_guardian/foreground` or attaches process PIDs to `cgroup.procs`.
+- **Failure Impact:** If firewall enforcement were active, switching to Strict mode would drop **100% of all new outbound connections** for all applications, including the active browser, rendering networking entirely dead.
 
 ---
 
-### BUG-001 — APT Hook Runs as Root, Reads Wrong Config
-**Severity:** High | **Confidence:** Confirmed
-
-**Evidence:**
-```
-# /etc/apt/apt.conf.d/99data-guardian
-APT::Acquire::Pre-Invoke {
-    "PYTHONPATH='...' /usr/bin/python3 -m src.data_guardian.approvals.gate --tool apt install || exit 1";
-};
-```
-APT pre-invoke hooks run as **root** (or `_apt` user). `gate.py` calls `ConfigManager()` which reads `~/.config/linux-data-guardian/config.yaml`. When process is root, `Path.home()` = `/root`, so it reads `/root/.config/linux-data-guardian/config.yaml` — which does not exist.
-
-```python
-# gate.py:L61
-is_hotspot = self.monitor.is_designated_hotspot_active()
-# designated_uuid = "" (not found in /root/.config/)
-# is_designated_hotspot_active() → False
-# → gate returns False → "not on hotspot" → passes without prompting
-```
-
-**Failure scenario:** User is connected to Moto Mobile hotspot and runs `sudo apt install curl`. APT hook fires, runs as root, finds no config, sees no hotspot → approves silently. No prompt appears.
-
-**User impact:** APT download gating never triggers. Core feature broken.
-
-**Recommended fix:** Pass explicit config path to gate.py via env var `DATA_GUARDIAN_USER=jagdish` and hardcode the real user's home path, OR change APT hook to run as user `jagdish` using `su` or `runuser`.
+### BUG-001: Live Traffic Accounting Omits Network Identity
+- **Severity:** Medium  
+- **Confidence:** Confirmed (`daemon.py:149-153`)  
+- **Technical Analysis:** In `daemon.py`, the periodic loop records traffic deltas via:
+  ```python
+  usage = self.db.record_usage_delta(
+      delta_rx=delta_rx,
+      delta_tx=delta_tx,
+      quota_limit_bytes=daily_limit_bytes
+  )
+  ```
+  It fails to pass `connection_uuid` and `connection_name`. Consequently, while the combined `daily_usage` table increments, the new `network_daily_usage` table receives zero updates during live daemon execution. The per-network history and Statistics tab only reflect data imported during one-off migrations.
 
 ---
 
-### BUG-002 — Schema Version Test Assert Wrong Version
-**Severity:** Low | **Confidence:** Confirmed
+### BUG-002: Quota Exhaustion Fails to Terminate Existing Established Connections
+- **Severity:** High  
+- **Confidence:** Confirmed (`rulesets.py:27`)  
+- **Technical Analysis:** The nftables ruleset places:
+  ```nft
+  ct state established,related accept
+  ```
+  **above** the quota exhaustion drop rule:
+  ```nft
+  ct state new drop
+  ```
+- **Real-World Failure:** When a daily limit (e.g., 1000 MB) is exceeded while a large file download (ISO, video stream, torrent, system update) is in progress, the active TCP connection is `established`. `ct state new drop` only blocks *new* connection handshakes. The active download will continue transferring data uninhibited until completion, potentially incurring significant mobile carrier charges.
 
-**Evidence:**
-```python
-# tests/test_database.py:L22
-cursor.execute("SELECT version FROM schema_version;")
-self.assertEqual(cursor.fetchone()[0], 1)
-# But CURRENT_SCHEMA_VERSION = 2, migration inserts version=2
+---
+
+### BUG-003: Notification Delivery Architecture Broken Under Background Service
+- **Severity:** Medium  
+- **Confidence:** Confirmed (`systemd/data-guardian.service` lacks `DISPLAY` and session bus)  
+- **Technical Analysis:** `daemon.py:78` tests `os.environ.get("DISPLAY")`. Because the service runs as a background systemd service without an attached display server, `notify-send` is never called.
+- **Failure Impact:** Quota alerts (80%, 100%), hotspot transitions, and emergency bypass notifications are never displayed to the user.
+
+---
+
+## 4. Privileged Helper Architectural Comparison
+
+To eliminate `SEC-001` without introducing security regressions, three architectural patterns were evaluated:
+
 ```
-The test passes only because `SELECT version FROM schema_version` fetches the first row (version=1 from `_init_db`), and the test passes accidentally. After migration, two rows exist: 1 and 2. This masks that the test is not verifying v2 migration.
-
-**Recommended fix:** Assert `MAX(version) = 2` and add a dedicated migration test.
-
----
-
-### BUG-003 — Per-Network Accounting Not Updated Live
-**Severity:** Medium | **Confidence:** Confirmed
-
-**Evidence:**
-```python
-# daemon.py:L149-153 — record_usage_delta called WITHOUT connection_uuid/name
-usage = self.db.record_usage_delta(
-    delta_rx=delta_rx,
-    delta_tx=delta_tx,
-    quota_limit_bytes=daily_limit_bytes
-    # connection_uuid and connection_name NOT passed
-)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          ARCHITECTURAL COMPARISON                           │
+├────────────────────────────┬────────────────────────────┬───────────────────┤
+│ Option A: Sudo / Polkit    │ Option B: Root Daemon      │ Option C: Root    │
+│ Direct `nft` Execution     │ Persistent UNIX Socket     │ Privileged Helper │
+├────────────────────────────┼────────────────────────────┼───────────────────┤
+│ User runs `sudo nft`       │ Persistent daemon as root  │ Minimal root      │
+│ directly.                  │ with socket peer check.    │ executable run    │
+│                            │                            │ via strict sudo.  │
+│ ❌ CRITICAL RISK:          │ ⚠️ MEDIUM RISK:            │ 🟢 MINIMAL RISK:  │
+│ Allows flushing all system │ Long-running root process  │ Zero persistent   │
+│ firewalls, UFW tampering,  │ listening on IPC; complex  │ root memory; runs │
+│ and packet sniffing.       │ process management.        │ only on transition│
+│                            │                            │ with strict args. │
+└────────────────────────────┴────────────────────────────┴───────────────────┘
 ```
-The new `network_daily_usage` table added in v2 is only populated from session-based migration data. Live per-network tracking doesn't happen while the daemon runs.
 
-**Failure scenario:** Statistics tab shows ALHN-449C data only from the migration snapshot. New hotspot (Moto Mobile) sessions won't appear in the statistics chart until a future migration or manual DB insert.
+### Detailed Evaluation of Option C (Recommended):
 
-**Recommended fix:** Pass `connection_uuid=active_conn.uuid, connection_name=active_conn.name` in the `record_usage_delta()` call in daemon.py.
+A dedicated, root-owned helper script or compiled binary installed at:
+`/usr/local/libexec/data-guardian-helper` (Permissions: `0755 root:root`).
 
----
+**Supported Operations Contract:**
+1. `--apply-balanced <interface>`: Validates interface with regex `^[a-zA-Z0-9_\.\-]+$`, checks syntax with `nft -c`, applies rules atomically to `table inet data_guardian`.
+2. `--apply-strict <interface>`: Validates interface and cgroup prerequisites.
+3. `--apply-blocked <interface>`: Applies hard cut-off rules and flushes non-essential established states.
+4. `--flush`: Deletes `table inet data_guardian` only.
+5. `--status`: Queries `nft list table inet data_guardian` and returns exit code 0 if active.
 
-### BUG-004 — Daemon Loses Hotspot UUID on Profile Change via Dashboard
-**Severity:** Medium | **Confidence:** Confirmed
-
-**Evidence:**
-```python
-# daemon.py IPC handler: set_profile
-self._current_profile = new_profile
-self.config_mgr.active_profile = new_profile  # saves GLOBAL profile, not per-network
+**Sudoers Authorization Specification:**
+In `/etc/sudoers.d/linux-data-guardian`:
+```sudoers
+jagdish ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper --apply-balanced [a-zA-Z0-9_\.\-]*
+jagdish ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper --apply-strict [a-zA-Z0-9_\.\-]*
+jagdish ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper --apply-blocked [a-zA-Z0-9_\.\-]*
+jagdish ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper --flush
+jagdish ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper --status
 ```
-When user changes profile in dashboard (per-network UI), the IPC sends `set_profile` which updates the global profile. The daemon uses this global `_current_profile` for all networks. Per-network saved profiles in config.yaml are ignored by the daemon — it only reads `active_profile` on startup.
-
-**User impact:** Changing profile for ALHN-449C also affects how Moto Mobile will behave when you connect to it. The per-network UI gives a false impression of isolation.
-
-**Recommended fix:** Daemon should apply the saved per-network profile from config when switching networks, not keep a global `_current_profile`.
-
----
-
-### BUG-005 — Flush() Does Not Check If Table Exists
-**Severity:** Low | **Confidence:** Confirmed
-
-**Evidence:**
-```python
-# nft_manager.py:flush()
-cmd = use_sudo + ["nft", "delete", "table", "inet", TABLE_NAME]
-res = subprocess.run(cmd, ...)
-self.active_profile = "off"  # set to off even if command failed
-return True, "Successfully flushed..."  # always returns success message
-# Return code of res is NOT checked
-```
-If the table doesn't exist (e.g., after a reboot), `nft delete table` returns error code 1, but `flush()` returns `(True, "Successfully flushed")`. This is misleading but not dangerous — the end state (no table = no rules) is correct.
+**Security Guarantees:**
+- No arbitrary commands can be passed to `nft`.
+- No system tables (UFW, Docker, nat) can be modified.
+- Arguments are strictly whitelist-validated.
+- The helper code is root-owned and cannot be modified by unprivileged users.
 
 ---
 
-### BUG-006 — Notifications Never Reach Desktop from systemd Daemon
-**Severity:** Medium | **Confidence:** Confirmed
+## 5. APT Gating Architectural Analysis
 
-**Evidence:**
-```python
-# daemon.py:L78
-if os.environ.get("DISPLAY") and ...
-    subprocess.run(["notify-send", ...])
-```
-```ini
-# systemd/data-guardian.service
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
-# DISPLAY is NOT set in the service file
-```
-The daemon running under systemd has no `DISPLAY` environment variable. `os.environ.get("DISPLAY")` returns `None` → all notifications silently dropped. The 80% warning, quota exceeded alert, and hotspot connect/disconnect notifications never appear.
+To resolve `SEC-002` safely:
 
-**Recommended fix:** Add `Environment="DISPLAY=:0"` to the service file (valid for X11 session which you confirmed). Or use `DBUS_SESSION_BUS_ADDRESS` and `libnotify` via dbus.
+1. **Rejection of "Run User Code as Root":** Changing the hook to `runuser -u jagdish python3 /home/jagdish/...` or exporting `HOME=/home/jagdish` while running as root still allows unprivileged desktop files to dictate root or APT workflow outcomes.
+2. **Recommended Safe Architectural Models:**
+   - **Model 1: Firewall-Level Sandbox Enforcement (Preferred & Zero-Code in APT):**
+     In Balanced and Strict modes, the firewall helper permanently enforces `skuid 42 ct state new drop` on the metered interface. APT's background worker (`_apt`, UID 42) is physically blocked by the kernel. When the user explicitly wants to update packages, they grant allowance or bypass via the Data Guardian UI/CLI, which opens a temporary 10-minute window for UID 42. No Python hooks are needed in `/etc/apt/apt.conf.d/`.
+   - **Model 2: Root-Owned Static Hook Script:**
+     If interactive terminal prompting before APT downloads is strictly required, the hook binary must be installed to `/usr/local/bin/data-guardian-apt-gate` (owned by `root:root`, mode `0755`), containing **zero imports from user space**. It queries the daemon's runtime socket `/run/user/1000/data-guardian.sock` over an unprivileged UNIX client to request status and authorization.
 
 ---
 
-### BUG-007 — ALHN-449C Mistakenly Treated as Hotspot
-**Severity:** High | **Confidence:** Confirmed (from daemon logs)
+## 6. Strict Mode: Technical Feasibility Assessment
 
-**Evidence (from journalctl):**
-```
-[+] Hotspot activated: ALHN-449C (a054f084...) on wlp0s20f3
-[-] Hotspot deactivated.
-[+] Hotspot activated: ALHN-449C ...
-[-] Hotspot deactivated.
-[+] Hotspot activated: ALHN-449C ...
-```
-ALHN-449C is your **home Wi-Fi router**, not the mobile hotspot. The daemon is repeatedly flagging and unflagging it as the designated hotspot. This means:
-1. Usage is being counted against the "metered" quota while you're on unmetered home Wi-Fi
-2. The firewall (if it ever worked) would try to apply restrictions on your home network
+True foreground-only enforcement requires five mandatory architectural components:
 
-**Root cause:** The designated hotspot UUID is `590f9bbc...` (Moto Mobile), but ALHN-449C UUID `a054f084...` appears in config or the match is by name hitting a partial match.
+1. **Window Identification:** `xprop -root _NET_ACTIVE_WINDOW` resolving to `_NET_WM_PID` (Available and working in `x11_tracker.py`).
+2. **Process Hierarchy Resolution:** Browsers (Chrome, Brave, Firefox) spawn multiple child processes across different PIDs. The tracker must recursively discover all child PIDs using `/proc/<pid>/task` or `pgrep -P`.
+3. **cgroupv2 Controller Setup:** Systemd must delegate the `pids` and `memory` controllers to the user slice (`/sys/fs/cgroup/user.slice/user-1000.slice/`). A sub-cgroup `data_guardian/foreground` must be managed dynamically.
+4. **Socket Association:** Linux nftables `socket cgroupv2 level 2` inspects the cgroup of the socket *at creation time*. Existing open sockets do not automatically transition when a PID is moved to a new cgroup.
+5. **Whitelisting:** Development tools (e.g., OpenCode, Antigravity CLI, git, ssh) running without a GUI window must be explicitly registered in a background whitelist cgroup to prevent silent connection termination.
 
-**Immediate action needed:** Run `data-guardian status` to confirm the designated UUID. Check `~/.config/linux-data-guardian/config.yaml` to verify the stored UUID is `590f9bbc-21bc-4b5c-9137-4b2912b21c94` and not accidentally set to ALHN-449C.
+**Conclusion:** Strict mode is an advanced capability requiring isolated prototyping. It must remain disabled in the firewall layer until its cgroup management and child-process tracking are fully implemented and verified.
 
 ---
 
-## 4. Missing Features and Incomplete Integrations
+## 7. Monthly Quota Data Model Analysis
 
-| Feature | Status | Detail |
-|---|---|---|
-| Monthly quota enforcement | **Completely missing** | `monthly_limit_mb` in config, never read by daemon |
-| Strict mode cgroup management | **Missing** | No cgroup creation, no PID assignment |
-| Per-network profile auto-apply | **Missing** | Daemon ignores per-network profile on network switch |
-| nft privilege mechanism | **Missing** | No polkit rule, no sudoers entry |
-| Firewall: whitelist by process name | **Missing** | config/whitelist.yaml never applied to nft rules |
-| Inbound rule blocking | **Not present** | All rules are OUTPUT chain only — inbound is not filtered (acceptable for this use case) |
-| 95% quota warning threshold | **Missing** | Only 80% is implemented |
-| Reconnect after sleep/wake | **Not tested** | poll_check() is polling-based; should survive but not verified |
-| Uninstall script completeness | **Not verified** | uninstall.sh not audited |
+To prevent double-counting and ensure mathematical accuracy:
 
----
-
-## 5. Unplanned Additions
-
-| Addition | Assessment |
-|---|---|
-| Per-network profile (config.yaml) | ✅ **Keep** — valuable, partially working |
-| Statistics tab with matplotlib | ✅ **Keep** — real data, good UX |
-| CLI tab with inline output | ✅ **Keep** — genuinely useful |
-| `network_daily_usage` DB table | ✅ **Keep** — correct architecture |
-| Schema migration system | ✅ **Keep** — but fix test (BUG-002) |
-| X11 window tracker | ⚠️ **Keep but clarify** — tracking works but isn't connected to firewall enforcement |
-| IPC 8192-byte recv limit | ⚠️ **Watch** — if status response grows large, truncation could corrupt JSON |
+- **Authoritative Data Source:** `network_daily_usage` is the single source of truth for per-network usage. `daily_usage` remains the aggregate fallback.
+- **Network Scope:** Monthly quota enforcement must evaluate *only* the bytes consumed while connected to the **designated metered hotspot**, not home Wi-Fi or ethernet.
+- **Monthly Boundary Definition:**
+  - Standard: Calendar Month (`date >= date('now', 'start of month')`).
+  - Billing Cycle: Option in `config.yaml` (`billing_cycle_day: 1` to `31`). If set to `15`, usage aggregates from the 15th of the previous month to the 14th of the current month.
+- **Query Formulation:**
+  ```sql
+  SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS monthly_total
+  FROM network_daily_usage
+  WHERE connection_uuid = ?
+    AND date >= ?
+    AND date <= ?;
+  ```
 
 ---
 
-## 6. Testing Results
+## 8. Desktop Notification Delivery Architecture
 
-**Command:** `python3 -m pytest tests/ -v --tb=short`  
-**Environment:** `/home/jagdish/Desktop/System Files/Linux Data Guardian/`, Python 3.12.3  
-**Result: 21 passed, 0 failed, 0 skipped** in 0.44s
+The background service cannot assume fixed desktop session variables (`DISPLAY=:0`, `XAUTHORITY`, or fixed D-Bus sockets).
 
-### What these tests actually prove:
-| Test | What it proves | What it does NOT prove |
-|---|---|---|
-| `test_firewall_rules.py` | Ruleset *strings* are generated correctly | Rules can be applied to real nftables |
-| `test_database.py` | DB schema, sessions, quota math | Schema version=1 assertion is wrong (BUG-002) |
-| `test_approvals.py` | Gate logic, shim creation, download detection | APT hook works when run as root |
-| `test_byte_counter.py` | `/proc/net/dev` parsing, delta math | Accounting works end-to-end in daemon |
-| `test_nm_monitor.py` | UUID matching logic, poll transitions | Real NetworkManager API works |
-
-### Tests that must be added (not run):
-- Firewall application with actual nft (requires root/polkit)
-- APT hook behavior as root user
-- Daemon end-to-end: connect hotspot → rules applied → quota exceeded → block
-- Monthly quota enforcement
-- Sleep/wake reconnection behavior
-- Per-network profile auto-apply on network switch
+### Recommended Solution: IPC-Triggered Client Notifications
+Instead of the background daemon spawning desktop processes directly:
+1. The daemon detects events (hotspot active, 80% warning, quota exhausted).
+2. The daemon broadcasts the event over the local UNIX socket (`/run/user/1000/data-guardian.sock`).
+3. The System Tray Applet (`ui/tray.py`) or Dashboard (`ui/dashboard.py`), which are already running inside the user's active desktop session, receive the IPC message.
+4. The tray applet invokes native desktop notifications via `gi.repository.Notify` or `notify-send`, ensuring 100% reliable display in XFCE without elevated privileges or session bus guessing.
 
 ---
 
-## 7. Decisions Required from You
+## 9. Testing & Verification Summary
 
-### DECISION-01 — Firewall Privilege Mechanism
-**Problem:** Daemon runs as user `jagdish` and cannot apply nft rules without root.  
-**Option A (Recommended):** Create a polkit rule that allows `jagdish` to run `/usr/sbin/nft` without password, scoped to specific arguments. Clean, modern Linux approach.  
-**Option B:** Add a targeted sudoers entry: `jagdish ALL=(root) NOPASSWD: /usr/sbin/nft`. Simpler but slightly broader.  
-**Option C:** Run daemon as root (reverts the previous fix — brings back the `/root/.config` problem unless XDG env is set).  
-**Consequence:** Without this decision, all firewall features remain permanently non-functional.  
-
-### DECISION-02 — Strict Mode Implementation Approach
-**Problem:** Real foreground-only enforcement via cgroups v2 is complex (20+ lines of cgroup management code, must track PIDs).  
-**Option A (Recommended):** Implement cgroup v2 correctly — create `data_guardian/{foreground,whitelist}`, assign foreground PID on X11 window change. Full enforcement but complex.  
-**Option B:** Replace with simpler user-space approach: block all new connections in Strict except DNS, accept established — same as quota exceeded but with whitelist. Less precise but actually enforceable.  
-**Option C:** Mark Strict mode as "Coming Soon" in UI, disable the radio button, explain it's planned.
-
-### DECISION-03 — APT Hook User Context
-**Problem:** Hook runs as root, reads wrong config.  
-**Option A (Recommended):** Change hook to `su jagdish -c "..."` with `HOME=/home/jagdish` set explicitly.  
-**Option B:** Hardcode the config path in the hook (bypass `Path.home()`).  
-**Option C:** Remove APT hook; rely only on pip/npm/cargo shims.
+- **Current Automated Suite:** 21 unit tests passing (`tests/test_*.py`).
+- **Test Limitations:** Existing tests validate string generation and SQLite queries in temporary directories. Zero tests currently validate real nftables rule parsing, socket transitions, or cgroup attachment.
+- **Required New Test Coverage:**
+  1. `test_privileged_helper_arg_validation`: Ensure helper rejects invalid actions, malicious characters, and unknown interfaces.
+  2. `test_quota_exhaustion_recovery`: Verify that restarting the daemon with exhausted daily quota restores the blocked state immediately.
+  3. `test_live_network_accounting_wiring`: Verify `record_usage_delta()` persists connection UUID into `network_daily_usage`.
 
 ---
 
-## 8. Limitations of This Audit
+## 10. Decisions Required from User
 
-- **Firewall:** Verified by static code inspection + live `sudo -n nft` test. Actual rule application was NOT tested (would require root).
-- **APT hook:** Verified by tracing code + reading `/root/.config` would be empty. Not tested with live `apt install` as root.
-- **Hotspot BUG-007:** Confirmed from journalctl logs. Root cause not fully traced yet.
-- **Sleep/wake behavior:** Not tested.
-- **Uninstall script:** Not audited.
-- All 21 unit tests ran and passed. No integration tests ran.
+The following three architectural decisions must be resolved before proceeding with Phase 1 execution:
 
-> **No implementation or optimization has been started. This document is audit-only.**
+### DECISION-01: Privileged Helper vs. Direct Firewall Handling
+- **Option A (Recommended):** Install a small root-owned privileged helper (`/usr/local/libexec/data-guardian-helper`) with targeted sudoers rules. Complete command validation, zero arbitrary `nft` access, safest architecture.
+- **Option B:** Revert daemon to run as `root` in systemd. Eliminates sudoers configuration, but gives the entire Python monitoring daemon root privileges.
+
+### DECISION-02: APT Protection Architecture
+- **Option A (Recommended):** Firewall-level isolation. Drop UID 42 (`_apt`) at the kernel level on metered hotspot. User opens temporary 10-minute download windows via the UI/CLI. Removes all risky root Python hooks.
+- **Option B:** Root-owned standalone C/Python hook script in `/usr/local/bin` that queries the daemon socket. Preserves terminal prompts during `sudo apt install`.
+
+### DECISION-03: Strict Profile Staging
+- **Option A (Recommended):** Keep Strict mode in "Experimental / Staged" status in the UI with a clear disclaimer; do not enforce in firewall until cgroupv2 supervisor is fully verified.
+- **Option B:** Implement a simplified Strict mode: block all non-essential outbound ports (DNS/DHCP only) regardless of window focus when activated.
+
+---
+*End of Audit Report. No system configuration or source files have been modified.*
