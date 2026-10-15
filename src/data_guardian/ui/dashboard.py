@@ -23,6 +23,7 @@ class DashboardWindow(Gtk.Window):
         self.set_default_size(480, 520)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_border_width(12)
+        self.set_icon_name("linux-data-guardian")
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.add(main_box)

@@ -53,7 +53,7 @@ class DataGuardianTray:
         self.backend = "xapp"
         self.status_icon = XApp.StatusIcon()
         self.status_icon.set_name("linux-data-guardian")
-        self.status_icon.set_icon_name("security-medium-symbolic")
+        self.status_icon.set_icon_name("linux-data-guardian")
         self.status_icon.set_tooltip_text("Linux Data Guardian (Click to open dashboard)")
         self.status_icon.set_primary_menu(self.menu)
         self.status_icon.set_secondary_menu(self.menu)
@@ -206,14 +206,11 @@ class DataGuardianTray:
             self.menu_status.set_label(f"QUOTA EXCEEDED ({conn_name})")
             self._set_tooltip(f"Data Guardian: Quota Exceeded on {conn_name}")
         elif is_hotspot:
-            if profile == "strict":
-                self._set_icon("security-high-symbolic")
-            else:
-                self._set_icon("security-medium-symbolic")
+            self._set_icon("linux-data-guardian")
             self.menu_status.set_label(f"Metered Hotspot: {conn_name} ({profile.title()})")
             self._set_tooltip(f"Data Guardian: {profile.title()} Mode on {conn_name}")
         else:
-            self._set_icon("network-wireless-symbolic")
+            self._set_icon("linux-data-guardian")
             self.menu_status.set_label(f"Unmetered Wi-Fi: {conn_name}")
             self._set_tooltip(f"Data Guardian: Unmetered ({conn_name})")
 

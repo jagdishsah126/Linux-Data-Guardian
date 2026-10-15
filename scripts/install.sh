@@ -14,13 +14,13 @@ echo "=================================================="
 
 # 1. Install user command symlink into ~/.local/bin
 mkdir -p "${HOME}/.local/bin"
-cat << 'EOF' > "${HOME}/.local/bin/data-guardian"
+cat << EOF > "${HOME}/.local/bin/data-guardian"
 #!/usr/bin/env bash
-PROJECT_DIR="/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian"
-PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}" /usr/bin/python3 -m src.data_guardian.main "$@"
+PROJECT_DIR="${PROJECT_ROOT}"
+PYTHONPATH="\${PROJECT_DIR}:\${PYTHONPATH:-}" /usr/bin/python3 -m src.data_guardian.main "\$@"
 EOF
 chmod +x "${HOME}/.local/bin/data-guardian"
-echo "[+] Installed 'data-guardian' command in ~/.local/bin/data-guardian"
+echo "[+] Installed 'data-guardian' command in ~/.local/bin/data-guardian (pointing to ${PROJECT_ROOT})"
 
 # 2. Install CLI shims (pip, npm, cargo)
 echo "[*] Installing developer tool shims in ~/.local/bin..."
