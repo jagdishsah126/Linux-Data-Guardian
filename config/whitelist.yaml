@@ -1,0 +1,40 @@
+# Linux Data Guardian — Whitelist Configuration
+# Defines applications, processes, and network ports permitted during Data Saver mode
+
+whitelist:
+  # Background command-line developer tools permitted to access network
+  # even in Strict (Foreground-Only) mode
+  developer_cli:
+    - opencode
+    - antigravity
+    - git
+    - ssh
+    - python3
+
+  # Web browsers permitted in Balanced Data Saver mode
+  browsers:
+    - brave
+    - brave-browser
+    - firefox
+    - google-chrome
+    - chromium
+
+  # Essential system network services
+  essential_services:
+    - systemd-resolved
+    - avahi-daemon
+    - cupsd
+
+  # Network ports and protocols always permitted
+  allowed_ports:
+    udp:
+      - 53      # DNS
+      - 67      # DHCP Client
+      - 68      # DHCP Server
+      - 123     # NTP (Time Sync)
+    tcp:
+      - 53      # DNS over TCP
+
+  # Always unrestricted interfaces
+  allowed_interfaces:
+    - lo        # Loopback

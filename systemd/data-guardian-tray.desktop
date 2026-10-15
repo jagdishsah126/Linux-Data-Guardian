@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Linux Data Guardian
+Comment=Mobile SIM Data Saver and Usage Monitor for XFCE
+Exec=python3 -m src.data_guardian.main tray
+Path=/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian
+Icon=network-wireless-symbolic
+Terminal=false
+Categories=Network;Monitor;Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

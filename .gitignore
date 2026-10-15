@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local SQLite databases & runtime locks
+*.db
+*.db-wal
+*.db-shm
+*.lock
+*.sock
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+*.swp
+*~

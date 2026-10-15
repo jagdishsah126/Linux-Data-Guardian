@@ -1,0 +1,44 @@
+# Linux Data Guardian — Default Configuration
+app:
+  name: "Linux Data Guardian"
+  version: "0.1.0"
+  enabled: true
+  # Available profiles: "balanced", "strict", "off"
+  # - balanced: silences background OS updates & telemetry, allows web surfing & coding tools, gates downloads
+  # - strict: foreground-only access (active X11 window) + whitelisted coding tools
+  # - off: monitoring only, no restrictions
+  default_profile: "balanced"
+  poll_interval_seconds: 5
+  idle_poll_interval_seconds: 15
+
+hotspot:
+  # Connection UUID from NetworkManager (e.g. from `nmcli connection show`)
+  # If empty, Data Guardian prompts or auto-detects on first run
+  designated_uuid: ""
+  designated_name: "NTC Hotspot"
+  auto_activate: true
+  enforce_metered_flag: true
+
+quotas:
+  # Daily limit in Megabytes (MB). 0 means unlimited.
+  daily_limit_mb: 1000
+  # Monthly limit in Megabytes (MB). 0 means unlimited.
+  monthly_limit_mb: 25000
+  warning_threshold_percent: 80
+  # Action when quota is reached: "block_unapproved" or "warn_only"
+  action_on_exhaustion: "block_unapproved"
+  daily_reset_time: "00:00"
+
+approvals:
+  # Enable download prompts before package manager downloads
+  apt: true
+  pip: true
+  npm: true
+  cargo: true
+  timeout_seconds: 60
+  # If user doesn't respond or closes modal: "deny" or "allow"
+  timeout_action: "deny"
+
+storage:
+  db_path: "~/.local/share/linux-data-guardian/guardian.db"
+  history_retention_days: 90
