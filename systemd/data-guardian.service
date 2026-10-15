@@ -5,14 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=jagdish
+Group=jagdish
 WorkingDirectory=/home/jagdish/Desktop/System Files/Linux Data Guardian
 Environment="PYTHONPATH=/home/jagdish/Desktop/System Files/Linux Data Guardian"
+Environment="HOME=/home/jagdish"
+Environment="XDG_CONFIG_HOME=/home/jagdish/.config"
+Environment="XDG_DATA_HOME=/home/jagdish/.local/share"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
 ExecStart=/usr/bin/python3 -m src.data_guardian.main daemon
 Restart=on-failure
 RestartSec=5
-ProtectSystem=full
-ProtectHome=read-only
+# No ProtectSystem/ProtectHome — user service reads from ~/.config
 
 [Install]
 WantedBy=multi-user.target
