@@ -53,12 +53,25 @@ class DataGuardianTray:
         self.backend = "xapp"
         self.status_icon = XApp.StatusIcon()
         self.status_icon.set_name("linux-data-guardian")
-        self.status_icon.set_icon_name("network-wireless-symbolic")
-        self.status_icon.set_tooltip_text("Linux Data Guardian")
+        self.status_icon.set_icon_name("security-medium-symbolic")
+        self.status_icon.set_tooltip_text("Linux Data Guardian (Click to open dashboard)")
         self.status_icon.set_primary_menu(self.menu)
         self.status_icon.set_secondary_menu(self.menu)
         self.status_icon.connect("activate", self._on_icon_clicked)
         self.status_icon.set_visible(True)
+
+        # Notify user that tray icon is running
+        try:
+            import subprocess
+            subprocess.run([
+                "notify-send",
+                "-u", "low",
+                "-i", "security-medium-symbolic",
+                "Linux Data Guardian",
+                "Tray applet is active in your bottom status bar."
+            ], check=False)
+        except Exception:
+            pass
 
     def _init_appindicator(self) -> None:
         """AppIndicator3 fallback."""
