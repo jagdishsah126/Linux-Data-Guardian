@@ -6,12 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian
-Environment="PYTHONPATH=/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian"
+WorkingDirectory=/home/jagdish/Desktop/System Files/Linux Data Guardian
+Environment="PYTHONPATH=/home/jagdish/Desktop/System Files/Linux Data Guardian"
 ExecStart=/usr/bin/python3 -m src.data_guardian.main daemon
 Restart=on-failure
 RestartSec=5
-# Hardening
 ProtectSystem=full
 ProtectHome=read-only
 

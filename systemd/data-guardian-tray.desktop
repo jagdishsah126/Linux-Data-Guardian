@@ -2,8 +2,7 @@
 Type=Application
 Name=Linux Data Guardian
 Comment=Mobile SIM Data Saver and Usage Monitor for XFCE
-Exec=python3 -m src.data_guardian.main tray
-Path=/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian
+Exec=/home/jagdish/.local/bin/data-guardian tray
 Icon=linux-data-guardian
 Terminal=false
 Categories=Network;Monitor;Utility;

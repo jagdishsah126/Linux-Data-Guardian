@@ -1,0 +1,20 @@
+# ============================================================
+# Linux Data Guardian — Permanent System Installation Notes
+# Run the SUDO commands below manually in your terminal.
+# ============================================================
+
+# STEP 1: Copy icon system-wide (so it shows in status bar)
+#   sudo cp /home/jagdish/Desktop/System\ Files/Linux\ Data\ Guardian/wifi.png \
+#       /usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png
+#   sudo gtk-update-icon-cache /usr/share/icons/hicolor
+
+# STEP 2: Install APT download gating hook (blocks apt installs on metered data)
+#   sudo cp /home/jagdish/Desktop/System\ Files/Linux\ Data\ Guardian/config/apt-hook-template.conf \
+#       /etc/apt/apt.conf.d/99data-guardian
+
+# STEP 3: Install the systemd background daemon (auto-starts at login)
+#   sudo cp /home/jagdish/Desktop/System\ Files/Linux\ Data\ Guardian/systemd/data-guardian.service \
+#       /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable data-guardian.service
+#   sudo systemctl start data-guardian.service
