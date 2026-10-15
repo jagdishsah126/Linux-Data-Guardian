@@ -33,14 +33,27 @@ if [ -f "/etc/apt/apt.conf.d/99data-guardian" ]; then
     echo "[+] Removed /etc/apt/apt.conf.d/99data-guardian"
 fi
 
-# 4. Remove CLI shims
+# 4. Remove Privileged Helper and Sudoers file if installed
+if [ -f "/usr/local/libexec/data-guardian-helper" ] || [ -f "/etc/sudoers.d/linux-data-guardian" ]; then
+    echo "[*] Removing privileged helper and sudoers configuration..."
+    sudo rm -f "/usr/local/libexec/data-guardian-helper"
+    sudo rm -f "/etc/sudoers.d/linux-data-guardian"
+    echo "[+] Removed data-guardian-helper and sudoers rule."
+fi
+
+# 5. Remove CLI shims
 echo "[*] Removing CLI shims from ~/.local/bin..."
 python3 -m src.data_guardian.main remove-shims 2>/dev/null || true
 
-# 5. Remove command symlink and desktop entry
+# 6. Remove command symlink, desktop entry, and icon
 rm -f "${HOME}/.local/bin/data-guardian"
 rm -f "${HOME}/.config/autostart/data-guardian-tray.desktop"
-echo "[+] Removed command and autostart entries."
+rm -f "${HOME}/.local/share/applications/data-guardian.desktop"
+if [ -f "/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png" ]; then
+    sudo rm -f "/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png" 2>/dev/null || true
+    sudo gtk-update-icon-cache /usr/share/icons/hicolor 2>/dev/null || true
+fi
+echo "[+] Removed command, autostart entries, and icons."
 
 echo ""
 echo "[✓] Linux Data Guardian uninstalled cleanly. System network is unaffected."

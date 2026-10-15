@@ -14,7 +14,9 @@ set -euo pipefail
 echo "[*] Linux Data Guardian: Initiating emergency disable..."
 
 # 1. Flush and delete the dedicated nftables table
-if command -v nft >/dev/null 2>&1; then
+if [ -x "/usr/local/libexec/data-guardian-helper" ]; then
+    sudo -n /usr/local/libexec/data-guardian-helper --flush 2>/dev/null && echo "[+] Flushed via privileged helper." || sudo /usr/local/libexec/data-guardian-helper --flush
+elif command -v nft >/dev/null 2>&1; then
     if sudo -n true 2>/dev/null; then
         sudo nft delete table inet data_guardian 2>/dev/null && echo "[+] Removed nftables table 'data_guardian'." || echo "[i] No active nftables table 'data_guardian' found."
     else

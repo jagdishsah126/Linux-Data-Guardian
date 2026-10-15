@@ -37,6 +37,7 @@ class DataGuardianDaemon:
         self._current_profile: str = self.config_mgr.active_profile
         self._is_quota_blocked: bool = False
         self._active_app_name: str = "unknown"
+        self._pending_notifications: List[Dict[str, str]] = []
 
         # Quota-state recovery on startup: check if today or this month already exceeded limits
         today_usage = self.db.get_today_usage()
@@ -89,7 +90,8 @@ class DataGuardianDaemon:
         sys.exit(0)
 
     def _notify(self, title: str, message: str, urgency: str = "normal") -> None:
-        """Sends desktop notification if notify-send and DISPLAY are available."""
+        """Sends desktop notification directly or queues for client UI pickup."""
+        self._pending_notifications.append({"title": title, "message": message, "urgency": urgency})
         if os.environ.get("DISPLAY") and subprocess.run(["which", "notify-send"], stdout=subprocess.DEVNULL).returncode == 0:
             try:
                 subprocess.run(["notify-send", "-u", urgency, title, message], check=False)
@@ -236,6 +238,8 @@ class DataGuardianDaemon:
                 connection_uuid=self.config_mgr.designated_hotspot_uuid or None,
                 billing_cycle_day=billing_day
             )
+            notifications = list(self._pending_notifications)
+            self._pending_notifications.clear()
             return {
                 "status": "ok",
                 "is_hotspot_active": is_hotspot,
@@ -251,6 +255,7 @@ class DataGuardianDaemon:
                 "monthly_total": monthly_usage.get("total_bytes", 0),
                 "monthly_limit_bytes": self.config_mgr.monthly_limit_mb * 1024 * 1024,
                 "active_app": self._active_app_name,
+                "notifications": notifications,
             }
 
         elif action == "set_profile":

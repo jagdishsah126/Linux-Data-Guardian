@@ -1,6 +1,7 @@
 """System tray applet for Linux Data Guardian supporting XApp.StatusIcon (Linux Mint) and AppIndicator."""
 
 from __future__ import annotations
+import subprocess
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib
@@ -215,6 +216,16 @@ class DataGuardianTray:
             self._set_tooltip(f"Data Guardian: Unmetered ({conn_name})")
 
         self.menu_usage.set_label(f"Today: {format_bytes(today_total)} / {format_bytes(daily_limit)}")
+
+        # Deliver desktop notifications queued by the daemon
+        for note in status.get("notifications", []):
+            try:
+                subprocess.run(
+                    ["notify-send", "-u", note.get("urgency", "normal"), note.get("title", "Linux Data Guardian"), note.get("message", "")],
+                    check=False
+                )
+            except Exception:
+                pass
 
         # Sync radio toggles without triggering callbacks
         if profile == "balanced" and not self.item_balanced.get_active():

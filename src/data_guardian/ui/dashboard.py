@@ -543,10 +543,15 @@ class DashboardWindow(Gtk.Window):
                 + (f" | Focused App: {active_app}" if active_app else "")
             )
 
-            # Auto-select current network in combo if not manually changed
-            active_uuid = status.get("connection_uuid", "")
-            if active_uuid and not self._selected_uuid:
-                self.combo_networks.set_active_id(active_uuid)
+            # Deliver desktop notifications queued by daemon
+            for note in status.get("notifications", []):
+                try:
+                    subprocess.run(
+                        ["notify-send", "-u", note.get("urgency", "normal"), note.get("title", "Linux Data Guardian"), note.get("message", "")],
+                        check=False
+                    )
+                except Exception:
+                    pass
 
         # Refresh stats for currently selected network
         if self._selected_uuid:
