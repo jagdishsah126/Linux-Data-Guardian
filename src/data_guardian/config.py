@@ -106,6 +106,27 @@ class ConfigManager:
         self.config["app"]["default_profile"] = profile
         self.save_user_config()
 
+    def get_network_profile(self, connection_uuid: str) -> str:
+        """Get the saved profile mode for a specific network UUID.
+        Defaults to 'balanced' for hotspot, 'off' for regular networks if not configured.
+        """
+        profiles = self.config.get("network_profiles", {})
+        return str(profiles.get(connection_uuid, "balanced"))
+
+    def set_network_profile(self, connection_uuid: str, profile: str) -> None:
+        """Persist a profile mode for a specific network UUID."""
+        if profile not in ("balanced", "strict", "off"):
+            raise ValueError(f"Invalid profile: {profile}")
+        if "network_profiles" not in self.config:
+            self.config["network_profiles"] = {}
+        self.config["network_profiles"][connection_uuid] = profile
+        self.save_user_config()
+
+    def get_network_name(self, connection_uuid: str) -> str:
+        """Return the saved display name for a network UUID if we have it."""
+        names = self.config.get("network_names", {})
+        return str(names.get(connection_uuid, connection_uuid[:8] + "..."))
+
     @property
     def daily_limit_mb(self) -> int:
         return int(self.config.get("quotas", {}).get("daily_limit_mb", 1000))
