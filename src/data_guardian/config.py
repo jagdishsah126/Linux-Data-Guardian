@@ -94,6 +94,17 @@ class ConfigManager:
         self.save_user_config()
 
     @property
+    def designated_hotspot_name(self) -> str:
+        return str(self.config.get("hotspot", {}).get("designated_name", "") or "")
+
+    @designated_hotspot_name.setter
+    def designated_hotspot_name(self, value: str) -> None:
+        if "hotspot" not in self.config:
+            self.config["hotspot"] = {}
+        self.config["hotspot"]["designated_name"] = value
+        self.save_user_config()
+
+    @property
     def active_profile(self) -> str:
         return str(self.config.get("app", {}).get("default_profile", "balanced"))
 

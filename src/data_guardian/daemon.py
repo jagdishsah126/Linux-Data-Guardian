@@ -229,6 +229,9 @@ class DataGuardianDaemon:
         """Handles commands sent by tray or dashboard UI."""
         action = req.get("action", "")
 
+        if action == "ping":
+            return {"status": "ok", "pong": True}
+
         if action == "get_status":
             today_usage = self.db.get_today_usage()
             active_conn = self.monitor.get_active_connection()
