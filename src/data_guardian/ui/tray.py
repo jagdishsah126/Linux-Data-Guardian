@@ -35,6 +35,7 @@ class DataGuardianTray:
 
     def __init__(self) -> None:
         self.dashboard_window: DashboardWindow | None = None
+        self._loading_profile: bool = False
         self._build_menu()
 
         self.backend = "none"
@@ -166,8 +167,10 @@ class DataGuardianTray:
         self.dashboard_window = None
 
     def _on_profile_selected(self, profile: str, is_active: bool) -> None:
-        if is_active:
-            send_ipc_command({"action": "set_profile", "profile": profile})
+        if self._loading_profile or not is_active:
+            return
+        send_ipc_command({"action": "set_profile", "profile": profile})
+        self._refresh_tray()
 
     def _emergency_bypass(self, widget: Gtk.Widget) -> None:
         send_ipc_command({"action": "emergency_bypass"})
@@ -228,12 +231,16 @@ class DataGuardianTray:
                 pass
 
         # Sync radio toggles without triggering callbacks
-        if profile == "balanced" and not self.item_balanced.get_active():
-            self.item_balanced.set_active(True)
-        elif profile == "strict" and not self.item_strict.get_active():
-            self.item_strict.set_active(True)
-        elif profile == "off" and not self.item_off.get_active():
-            self.item_off.set_active(True)
+        self._loading_profile = True
+        try:
+            if profile == "balanced" and not self.item_balanced.get_active():
+                self.item_balanced.set_active(True)
+            elif profile == "strict" and not self.item_strict.get_active():
+                self.item_strict.set_active(True)
+            elif profile == "off" and not self.item_off.get_active():
+                self.item_off.set_active(True)
+        finally:
+            self._loading_profile = False
 
         return True
 

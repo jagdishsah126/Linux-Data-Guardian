@@ -259,8 +259,6 @@ class DashboardWindow(Gtk.Window):
         dd_row.pack_start(dd_label, False, False, 0)
 
         self.combo_networks = Gtk.ComboBoxText()
-        self._populate_network_combo()
-        self.combo_networks.connect("changed", self._on_network_selected)
         dd_row.pack_start(self.combo_networks, True, True, 0)
 
         # Hotspot star button
@@ -356,7 +354,10 @@ class DashboardWindow(Gtk.Window):
         self.log_list = Gtk.ListBox()
         scrolled.add(self.log_list)
         log_box.pack_start(scrolled, True, True, 0)
-        outer.pack_start(log_frame, True, True, 0)
+        # Now that all UI frames (usage, profile, network) are instantiated,
+        # connect signals and populate the combo box with active network stats:
+        self.combo_networks.connect("changed", self._on_network_selected)
+        self._populate_network_combo()
 
         return outer
 
@@ -380,7 +381,7 @@ class DashboardWindow(Gtk.Window):
                 "Usage is still tracked in Statistics.</span></small>"
             )
 
-    def _populate_network_combo(self) -> None:
+    def _populate_network_combo(self, preferred_uuid: str = "") -> None:
         """Fill the network dropdown with all saved wireless connections."""
         self.combo_networks.remove_all()
         self._saved_connections = [
@@ -389,7 +390,6 @@ class DashboardWindow(Gtk.Window):
         ]
         # Also add any networks we've tracked data for but aren't in saved list
         known = self.db.get_known_networks()
-        known_uuids = {n["connection_uuid"] for n in known}
         saved_uuids = {c["uuid"] for c in self._saved_connections}
         for n in known:
             if n["connection_uuid"] not in saved_uuids:
@@ -400,15 +400,30 @@ class DashboardWindow(Gtk.Window):
                 })
 
         desig_uuid = self.config_mgr.designated_hotspot_uuid
+
+        # Target selection: 1. preferred_uuid -> 2. currently active network -> 3. designated hotspot -> 4. first network
+        target_uuid = preferred_uuid or self._selected_uuid
+        if not target_uuid:
+            status = send_ipc_command({"action": "get_status"})
+            if status and status.get("connection_uuid"):
+                target_uuid = status["connection_uuid"]
+            elif desig_uuid:
+                target_uuid = desig_uuid
+            elif self._saved_connections:
+                target_uuid = self._saved_connections[0]["uuid"]
+
         selected_idx = 0
         for idx, conn in enumerate(self._saved_connections):
             star = " ⭐" if conn["uuid"] == desig_uuid else ""
             self.combo_networks.append(conn["uuid"], f"{conn['name']}{star}")
-            if conn["uuid"] == desig_uuid and not self._selected_uuid:
+            if target_uuid and conn["uuid"] == target_uuid:
                 selected_idx = idx
 
         if self._saved_connections:
+            chosen_conn = self._saved_connections[selected_idx]
+            self._selected_uuid = chosen_conn["uuid"]
             self.combo_networks.set_active(selected_idx)
+            self._refresh_network_panel(self._selected_uuid)
 
     def _on_network_selected(self, combo: Gtk.ComboBoxText) -> None:
         """When user selects a network in dropdown — update stats and profile UI."""
@@ -433,10 +448,9 @@ class DashboardWindow(Gtk.Window):
         self.config_mgr.config["hotspot"]["designated_name"] = name
         self.config_mgr.save_user_config()
         send_ipc_command({"action": "set_hotspot_uuid", "uuid": self._selected_uuid})
-        # Refresh combo to update star
-        self._populate_network_combo()
-        # Re-select same network
-        self.combo_networks.set_active_id(self._selected_uuid)
+        # Refresh combo to update star while preserving currently active selection
+        curr = self._selected_uuid
+        self._populate_network_combo(preferred_uuid=curr)
 
     def _refresh_network_panel(self, uuid: str) -> None:
         """Refresh the usage stats and profile radio for the given network UUID."""
@@ -470,16 +484,27 @@ class DashboardWindow(Gtk.Window):
             )
 
         # Profile radio (per-network)
-        saved_profile = self.config_mgr.get_network_profile(uuid)
-        self._loading_profile = True
-        if saved_profile == "strict":
-            self.radio_strict.set_active(True)
-        elif saved_profile == "off":
-            self.radio_off.set_active(True)
+        # If this is the active network, sync with live daemon profile if available
+        status = send_ipc_command({"action": "get_status"})
+        active_uuid = status.get("connection_uuid", "") if status else ""
+        if uuid == active_uuid and status and "current_profile" in status:
+            saved_profile = status["current_profile"]
+            if self.config_mgr.get_network_profile(uuid) != saved_profile:
+                self.config_mgr.set_network_profile(uuid, saved_profile)
         else:
-            self.radio_balanced.set_active(True)
-        self.profile_desc_label.set_markup(self._profile_description(saved_profile))
-        self._loading_profile = False
+            saved_profile = self.config_mgr.get_network_profile(uuid)
+
+        self._loading_profile = True
+        try:
+            if saved_profile == "strict":
+                self.radio_strict.set_active(True)
+            elif saved_profile == "off":
+                self.radio_off.set_active(True)
+            else:
+                self.radio_balanced.set_active(True)
+            self.profile_desc_label.set_markup(self._profile_description(saved_profile))
+        finally:
+            self._loading_profile = False
 
     def _on_profile_toggled(self, profile_name: str, is_active: bool) -> None:
         if not is_active or self._loading_profile:
@@ -552,6 +577,13 @@ class DashboardWindow(Gtk.Window):
                     )
                 except Exception:
                     pass
+
+        # Auto-select active network if _selected_uuid is somehow not initialized
+        if not self._selected_uuid and self._saved_connections:
+            active_uuid = status.get("connection_uuid", "") if status else ""
+            target = active_uuid or self.config_mgr.designated_hotspot_uuid or self._saved_connections[0]["uuid"]
+            self._selected_uuid = target
+            self.combo_networks.set_active_id(target)
 
         # Refresh stats for currently selected network
         if self._selected_uuid:
@@ -793,7 +825,7 @@ class DashboardWindow(Gtk.Window):
         for group in CLI_COMMANDS:
             # Group header
             grp_lbl = Gtk.Label(xalign=0)
-            grp_lbl.set_markup(f"<b>{group['group']}</b>")
+            grp_lbl.set_markup(f"<b>{GLib.markup_escape_text(group['group'])}</b>")
             grp_lbl.set_margin_top(8)
             left_box.pack_start(grp_lbl, False, False, 0)
             left_box.pack_start(

@@ -267,12 +267,19 @@ class DataGuardianDaemon:
                 self._current_profile = new_profile
                 self.config_mgr.active_profile = new_profile
                 active_conn = self.monitor.get_active_connection()
+                if active_conn:
+                    self.config_mgr.set_network_profile(active_conn.uuid, new_profile)
                 if self.monitor.is_designated_hotspot_active():
                     self.firewall.apply_profile(
                         new_profile,
                         interface=(active_conn.interface if active_conn else ""),
                         quota_exceeded=self._is_quota_blocked
                     )
+                self._notify(
+                    "Data Guardian Profile",
+                    f"Profile switched to {new_profile.upper()} mode.",
+                    urgency="normal"
+                )
                 return {"status": "ok", "profile": new_profile}
             return {"status": "error", "message": "Invalid profile"}
 
