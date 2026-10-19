@@ -53,32 +53,34 @@ Following an extensive architectural and security review, all critical vulnerabi
 
 ## 4. Duplicate Artifacts & System Footprint Inspection
 
-During development across multiple phases, certain duplicate assets and checkout directories were created. Here is the complete inspection:
+During development across multiple phases, duplicate assets and development artifacts were identified and cleaned up as follows:
 
-### 4.1 Icon Files (3 Locations Found)
+### 4.1 Icon Files (Cleaned Up)
 * `/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png`  
-  *(**Primary / Active**: Used by system-wide `.desktop` entries and GTK theme engine).*
-* `/home/jagdish/.local/share/icons/linux-data-guardian.png`  
-  *(Duplicate created during early desktop launcher testing).*
-* `/home/jagdish/.local/share/icons/hicolor/512x512/apps/linux-data-guardian.png`  
-  *(Duplicate created during local user icon installation).*
-
-> **Recommendation:** Keeping the system-wide `/usr/share/icons/...` copy is sufficient. The two files in `~/.local/share/icons/` are harmless, but can be removed if a 100% clean single-instance setup is desired.
+  *(**Primary / Active**: Preserved as the single authoritative icon for desktop launchers, application menu, and GTK panel).*
+* `~/.local/share/icons/linux-data-guardian.png`  
+  *(**Removed**: Cleaned up duplicate).*
+* `~/.local/share/icons/hicolor/512x512/apps/linux-data-guardian.png`  
+  *(**Removed**: Cleaned up duplicate).*
 
 ---
 
-### 4.2 Repository Directories (2 Working Copies)
-* `/home/jagdish/Desktop/System Files/Linux Data Guardian/`  
-  *(**Primary Production Directory**: The systemd service `/etc/systemd/system/data-guardian.service` and CLI launcher `/home/jagdish/.local/bin/data-guardian` execute strictly from here).*
+### 4.2 Workspace Separation (Build vs. Production Deployment)
 * `/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian/`  
-  *(**Development Clone**: Created for pair programming under the Zara workspace).*
-
-> **Safety Check regarding deletion:**  
-> You can **safely remove** `/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian/` at any time. It will **not** break Linux Data Guardian, because the systemd daemon, tray launcher, and sudoers rules all point exclusively to `/home/jagdish/Desktop/System Files/Linux Data Guardian`.
+  *(**Development & Build Workspace**: Contains full test suite (`tests/`), development planning docs (`plan.md`, `audit.md`, `step.md`), and build assets. All tests pass here via `pytest`).*
+* `/home/jagdish/Desktop/System Files/Linux Data Guardian/`  
+  *(**Live Production Deployment**: Contains strictly runtime code (`src/`), config templates (`config/`), scripts (`scripts/`), and systemd units (`systemd/`). All tests, planning docs, and cache artifacts have been removed to keep the deployment lean and lightweight).*
 
 ---
 
-### 4.3 CLI Interception Shims in `~/.local/bin/` (4 Installed)
+### 4.3 Root Artifacts Cleaned Up
+* Loose duplicate root image `wifi.png` removed (preserved in `assets/wifi.png`).
+* Temporary scratch file `SUDO_INSTALL_STEPS.txt` removed.
+* Local `.pytest_cache/` and `__pycache__` artifacts purged from deployment root.
+
+---
+
+### 4.4 CLI Interception Shims in `~/.local/bin/` (4 Installed)
 * `~/.local/bin/pip`
 * `~/.local/bin/pip3`
 * `~/.local/bin/npm`
@@ -93,7 +95,7 @@ These scripts were installed by `data-guardian install-shims` to intercept packa
 
 ---
 
-### 4.4 Co-existing Project: "Linux Data Monitor"
+### 4.5 Co-existing Project: "Linux Data Monitor"
 * Location: `/home/jagdish/Desktop/System Files/Linux Data Monitor/`
 * Process: `dm-collector` (PID running on system).
 * Symlinks: `~/.local/bin/data-monitor`, `dm-collector`, `dm-panel`, `dm-popup`.
