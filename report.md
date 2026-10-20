@@ -83,7 +83,7 @@ on live data.
 Completed:
 
 * Source committed as `13b19ef`, deploy fix as `30490af`, audit completion as
-  `4bc3300`, and the BUG-61/BUG-62 fixes as the latest commit on `main`.
+  `4bc3300`, and the BUG-61/BUG-62 fixes as `58e8795`, pushed to `origin/main`.
 * The deploy target's `.git` was backed up to
   `/tmp/opencode/ldg-deploy-git-backup/git-dir.tar.gz` and removed (the target
   `HEAD` was an ancestor of `main`, and its three modified files were
