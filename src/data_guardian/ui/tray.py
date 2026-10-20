@@ -37,6 +37,7 @@ from src.data_guardian.ui.dashboard import DashboardWindow  # noqa: E402
 from src.data_guardian.window_tracker.x11_tracker import X11WindowTracker  # noqa: E402
 
 REFRESH_SECONDS = 3
+ICON_NAME = "linux-data-guardian"
 
 
 class DataGuardianTray:
@@ -67,8 +68,8 @@ class DataGuardianTray:
     def _init_xapp(self) -> None:
         self.backend = "xapp"
         self.status_icon = XApp.StatusIcon()
-        self.status_icon.set_name("linux-data-guardian")
-        self.status_icon.set_icon_name("linux-data-guardian")
+        self.status_icon.set_name(ICON_NAME)
+        self.status_icon.set_icon_name(ICON_NAME)
         self.status_icon.set_tooltip_text("Linux Data Guardian")
         self.status_icon.set_primary_menu(self.menu)
         self.status_icon.set_secondary_menu(self.menu)
@@ -79,7 +80,7 @@ class DataGuardianTray:
         self.backend = "appindicator"
         self.indicator = AppIndicator3.Indicator.new(
             "linux-data-guardian-tray",
-            "linux-data-guardian",
+            ICON_NAME,
             AppIndicator3.IndicatorCategory.SYSTEM_SERVICES,
         )
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -88,7 +89,7 @@ class DataGuardianTray:
     def _init_gtk_status_icon(self) -> None:
         self.backend = "gtk"
         self.gtk_icon = Gtk.StatusIcon()
-        self.gtk_icon.set_from_icon_name("linux-data-guardian")
+        self.gtk_icon.set_from_icon_name(ICON_NAME)
         self.gtk_icon.set_tooltip_text("Linux Data Guardian")
         self.gtk_icon.connect("activate", self._on_icon_clicked)
         self.gtk_icon.connect("popup-menu", self._on_gtk_popup_menu)
@@ -250,8 +251,10 @@ class DataGuardianTray:
     def _apply_tray_status(self, status: Optional[Dict[str, Any]]) -> bool:
         """Apply a poll result on the GTK main thread."""
         self._refresh_inflight = False
+        # The panel icon is always the green app icon. State is communicated
+        # by the tooltip and menu text, never by swapping in theme icons.
+        self._set_icon(ICON_NAME)
         if not status or status.get("status") != "ok":
-            self._set_icon("network-wireless-symbolic")
             self._set_tooltip("Linux Data Guardian: daemon inactive")
             self.menu_status.set_label("Data Guardian: daemon inactive")
             self.menu_usage.set_label("Usage: —")
@@ -277,24 +280,20 @@ class DataGuardianTray:
         daily_limit = int(status.get("daily_limit_bytes", 0) or 0)
 
         if firewall_error:
-            self._set_icon("dialog-error-symbolic")
             self.menu_status.set_label("PROTECTION FAILED")
             self._set_tooltip(f"Data Guardian: firewall error — {firewall_error}")
             self.menu_warning.set_label(f"⚠ {firewall_error[:60]}")
             self.menu_warning.show()
         elif blocked:
-            self._set_icon("dialog-warning-symbolic")
             reason = status.get("quota_reason") or "daily"
             self.menu_status.set_label(f"QUOTA EXCEEDED ({reason}) — {conn_name}")
             self._set_tooltip(f"Data Guardian: quota exceeded on {conn_name}")
             self.menu_warning.hide()
         elif is_hotspot:
-            self._set_icon("linux-data-guardian")
             self.menu_status.set_label(f"Metered hotspot: {conn_name} ({profile})")
             self._set_tooltip(f"Data Guardian: {profile} on {conn_name}")
             self.menu_warning.hide()
         else:
-            self._set_icon("linux-data-guardian")
             self.menu_status.set_label(f"Unmetered: {conn_name}")
             self._set_tooltip(f"Data Guardian: unmetered ({conn_name})")
             self.menu_warning.hide()
