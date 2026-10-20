@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -144,16 +145,20 @@ class TestHelperProbe(unittest.TestCase):
 
     @unittest.skipIf(os.geteuid() == 0, "root needs no sudo probe")
     def test_inactive_table_still_counts_as_accessible(self):
-        with patch.object(NftablesManager, "get_helper_path",
-                          return_value=Path("/usr/local/libexec/data-guardian-helper")), \
+        # Use a real temporary path: can_apply_rules() checks existence before
+        # probing, and the test must not depend on the host's installed helper.
+        with tempfile.NamedTemporaryFile() as helper, \
+             patch.object(NftablesManager, "get_helper_path",
+                          return_value=Path(helper.name)), \
              patch.object(NftablesManager, "_run", return_value=(1, "inactive", "")) as run:
             self.assertTrue(NftablesManager.can_apply_rules())
             self.assertIn("--status", run.call_args.args[0])
 
     @unittest.skipIf(os.geteuid() == 0, "root needs no sudo probe")
     def test_sudo_denial_is_not_accessibility(self):
-        with patch.object(NftablesManager, "get_helper_path",
-                          return_value=Path("/usr/local/libexec/data-guardian-helper")), \
+        with tempfile.NamedTemporaryFile() as helper, \
+             patch.object(NftablesManager, "get_helper_path",
+                          return_value=Path(helper.name)), \
              patch.object(NftablesManager, "_run",
                           return_value=(1, "", "sudo: a password is required")):
             self.assertFalse(NftablesManager.can_apply_rules())
