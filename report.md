@@ -59,8 +59,9 @@ on live data.
   GTK caches warm. The earlier `< 35 MB` claim was false.
 * The runtime database is `~/.local/share/linux-data-guardian/guardian.db`
   (0600) in WAL mode.
-* The Unix socket is created under the systemd runtime directory
-  (`/run/data-guardian/data-guardian.sock`) with mode 0600.
+* The fixed code creates the Unix socket under the systemd runtime directory
+  (`/run/data-guardian/data-guardian.sock`) with mode 0600; live verification
+  awaits the pending reinstall/restart.
 * A second daemon refuses to start (flock + live-socket probe).
 * The first live reinstall exposed two bugs that the suite did not cover:
   the daemon and CLI met at different socket paths (BUG-61), and every SQLite
