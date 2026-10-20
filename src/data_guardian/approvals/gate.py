@@ -1,176 +1,240 @@
-"""Universal approval gate for package managers and download operations."""
+"""Universal approval gate for package managers and download operations.
+
+The gate is invoked by the transparent CLI shims (``pip``, ``pip3``, ``npm``,
+``cargo``, ...) and decides whether a command may reach the network while the
+metered hotspot is active.
+"""
 
 from __future__ import annotations
-import os
-import sys
+
 import argparse
-import subprocess
+import os
+import shlex
+import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from src.data_guardian.config import ConfigManager
 from src.data_guardian.database import Database
 from src.data_guardian.network.nm_monitor import NetworkMonitor
 
-DOWNLOAD_ACTIONS = {
-    "apt": ["install", "upgrade", "dist-upgrade", "full-upgrade", "update", "source"],
-    "pip": ["install", "download", "wheel"],
-    "npm": ["install", "i", "update", "up", "add"],
-    "cargo": ["install", "update", "add"],
+# Sub-commands that fetch bytes from the network.
+DOWNLOAD_ACTIONS: Dict[str, set] = {
+    "apt": {"install", "upgrade", "dist-upgrade", "full-upgrade", "update", "source", "build-dep"},
+    "apt-get": {"install", "upgrade", "dist-upgrade", "full-upgrade", "update", "source", "build-dep"},
+    "aptitude": {"install", "upgrade", "update", "safe-upgrade"},
+    "pip": {"install", "download", "wheel"},
+    "pip3": {"install", "download", "wheel"},
+    "python": set(),
+    "python3": set(),
+    "npm": {"install", "i", "update", "up", "add", "ci", "create", "dlx", "exec", "x"},
+    "npx": {"install", "add", "create", "dlx", "exec", "x"},
+    "yarn": {"install", "add", "up", "upgrade", "dlx", "create"},
+    "pnpm": {"install", "i", "add", "update", "up", "dlx", "create", "fetch"},
+    "cargo": {"install", "update", "add", "fetch", "vendor", "publish"},
+    "gem": {"install", "update", "fetch"},
+    "go": {"get", "install", "mod"},
+    "flatpak": {"install", "update", "repair"},
+    "snap": {"install", "refresh"},
+}
+
+# Sub-commands that never touch the network.
+READ_ONLY_ACTIONS = {
+    "list", "show", "info", "view", "search", "freeze", "check", "config", "help",
+    "version", "why", "outdated", "--version", "-v", "-vv", "--help", "-h",
+    "hash", "ls", "which", "doctor", "env", "get", "cache", "tree", "audit",
+}
+
+# Global flags that consume the following token, so it must not be read as a command.
+FLAGS_WITH_VALUE = {
+    "-c", "--config", "-r", "--requirement", "-t", "--target",
+    "-i", "--index-url", "--extra-index-url", "--proxy", "--cert", "--cache-dir",
+    "-o", "--output", "--prefix", "--root", "--user", "--python", "-p",
+    "--registry", "--tag", "--git", "--path", "--branch", "--features",
 }
 
 
+def _tokens(args: List[str]) -> List[str]:
+    return [a for a in args if a]
+
+
+def find_subcommand(tool: str, args: List[str]) -> Optional[str]:
+    """Return the first meaningful sub-command token.
+
+    Handles ``python -m pip install x`` and skips flags together with their values.
+    """
+    tokens = _tokens(args)
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in ("-m", "--module") and i + 1 < len(tokens):
+            module = tokens[i + 1]
+            if module.startswith("pip"):
+                tool = module
+            i += 2
+            continue
+        if token.startswith("-"):
+            if token in FLAGS_WITH_VALUE:
+                i += 2
+                continue
+            i += 1
+            continue
+        return token.lower()
+    return None
+
+
 class ApprovalGate:
-    """Evaluates whether a package operation requires user confirmation and prompts the user."""
+    """Evaluates whether a package operation requires confirmation and prompts the user."""
 
     def __init__(self, config_manager: ConfigManager | None = None) -> None:
         self.config_mgr = config_manager or ConfigManager()
-        self.db = Database(self.config_mgr.db_path)
+        self.db = Database(
+            self.config_mgr.db_path,
+            designated_uuid=self.config_mgr.designated_hotspot_uuid,
+        )
         self.monitor = NetworkMonitor(
             designated_uuid=self.config_mgr.designated_hotspot_uuid,
-            designated_name=self.config_mgr.config.get("hotspot", {}).get("designated_name", "")
+            designated_name=self.config_mgr.config.get("hotspot", {}).get("designated_name", ""),
         )
 
-    def is_download_action(self, tool: str, args: List[str]) -> bool:
-        """Determines if the given arguments represent a network download/install operation."""
-        tool_lower = tool.lower()
-        if tool_lower not in DOWNLOAD_ACTIONS:
-            return True  # Unknown tool -> default to gating if configured
+    # ------------------------------------------------------------------ policy
 
-        relevant_actions = DOWNLOAD_ACTIONS[tool_lower]
-        for arg in args:
-            if not arg.startswith("-"):
-                return arg.lower() in relevant_actions
-        return False
+    def is_download_action(self, tool: str, args: List[str]) -> bool:
+        """True only when the command would actually fetch data from the network."""
+        tool_lower = tool.lower()
+        if tool_lower in ("python", "python3"):
+            # `python -m pip install x` — inspect the module token.
+            tokens = _tokens(args)
+            for i, token in enumerate(tokens):
+                if token in ("-m", "--module") and i + 1 < len(tokens) and tokens[i + 1].startswith("pip"):
+                    tool_lower = tokens[i + 1]
+                    break
+            else:
+                return False
+
+        actions = DOWNLOAD_ACTIONS.get(tool_lower)
+        if actions is None:
+            return False
+
+        sub = find_subcommand(tool_lower, args)
+        if sub is None:
+            return False
+        if sub in READ_ONLY_ACTIONS:
+            return False
+        return sub in actions
 
     def should_gate(self, tool: str, args: List[str]) -> Tuple[bool, str]:
-        """Checks policies to determine if the operation must be gated.
-
-        Returns (should_gate: bool, reason: str).
-        """
-        # 1. Global enable check
-        if not self.config_mgr.config.get("app", {}).get("enabled", True):
+        if not self.config_mgr.app_enabled:
             return False, "Data Guardian is globally disabled."
 
-        # 2. Profile check
-        profile = self.config_mgr.active_profile
+        active = self.monitor.get_active_connection()
+        is_hotspot = self.monitor.matches_designated(active)
+        if not is_hotspot and not (active and active.is_metered):
+            return False, "Not connected to a metered hotspot."
+
+        # The per-network profile is authoritative, exactly as in the daemon.
+        profile = (
+            self.config_mgr.get_network_profile(active.uuid)
+            if active else self.config_mgr.active_profile
+        )
         if profile == "off":
             return False, "Profile is set to 'off' (monitoring only)."
 
-        # 3. Hotspot check
-        is_hotspot = self.monitor.is_designated_hotspot_active()
-        if not is_hotspot:
-            # Check if active connection is marked as metered in NetworkManager
-            active_conn = self.monitor.get_active_connection()
-            if not (active_conn and active_conn.is_metered):
-                return False, "Not connected to a metered hotspot."
-
-        # 4. Tool-specific approval setting
         approvals_cfg = self.config_mgr.config.get("approvals", {})
         if not approvals_cfg.get(tool.lower(), True):
             return False, f"Approval for tool '{tool}' is disabled in configuration."
 
-        # 5. Check if arguments involve downloading
         if not self.is_download_action(tool, args):
-            return False, f"Action '{' '.join(args)}' does not initiate downloads."
+            return False, "Command does not initiate a network download."
 
         return True, "Metered connection active; download approval required."
 
+    # ------------------------------------------------------------------ prompt
+
+    def _record(self, tool: str, args: List[str], decision: str) -> None:
+        try:
+            self.db.record_approval_event(
+                tool=tool,
+                packages=" ".join(args)[:500],
+                estimated_bytes=0,
+                decision=decision,
+            )
+        except Exception as exc:  # noqa: BLE001 - auditing must never block a decision
+            print(f"[!] Could not record approval event: {exc}", file=sys.stderr)
+
     def prompt_user(self, tool: str, args: List[str]) -> bool:
-        """Displays approval prompt via Zenity or interactive terminal.
-
-        Returns True if approved, False if denied/timed out.
-        """
-        packages_summary = " ".join(args) or "unspecified"
+        """Ask the user. Returns True when the download may proceed."""
+        approvals_cfg = self.config_mgr.config.get("approvals", {})
+        timeout = int(approvals_cfg.get("timeout_seconds", 60))
+        on_timeout = str(approvals_cfg.get("timeout_action", "deny"))
         display = os.environ.get("DISPLAY")
-        timeout = int(self.config_mgr.config.get("approvals", {}).get("timeout_seconds", 60))
 
-        dialog_text = (
-            f"<b>Linux Data Guardian — Download Approval</b>\n\n"
-            f"An application is requesting internet downloads on your <b>metered mobile data</b>.\n\n"
-            f"<b>Tool:</b> {tool}\n"
-            f"<b>Command / Target:</b> {packages_summary}\n\n"
-            f"Do you want to approve this download?"
-        )
+        try:
+            command_str = " ".join(shlex.quote(a) for a in args)
+        except Exception:  # noqa: BLE001
+            command_str = " ".join(args)
+        summary = f"{tool} {command_str}".strip()[:400]
 
         approved = False
-
-        # Attempt Zenity GUI prompt if DISPLAY is present
         if display and Path("/usr/bin/zenity").exists():
             try:
-                cmd = [
-                    "/usr/bin/zenity",
-                    "--question",
+                res = subprocess_run([
+                    "/usr/bin/zenity", "--question",
                     "--title=Linux Data Guardian — Download Approval",
-                    f"--text={dialog_text}",
+                    f"--text=<b>Download approval needed</b>\n\nMetered mobile data is active.\n\n"
+                    f"<b>Command:</b> {summary}\n\nApprove this download?",
                     f"--timeout={timeout}",
-                    "--ok-label=Approve Download",
-                    "--cancel-label=Deny / Cancel",
-                    "--width=450",
-                ]
-                res = subprocess.run(cmd, timeout=timeout + 5)
-                approved = (res.returncode == 0)
-            except Exception as e:
-                print(f"[!] Warning: Zenity dialog failed: {e}")
+                    "--ok-label=Approve", "--cancel-label=Deny", "--width=460",
+                ], timeout=timeout + 5)
+                approved = res == 0
+            except Exception as exc:  # noqa: BLE001
+                print(f"[!] Warning: Zenity dialog failed: {exc}", file=sys.stderr)
+                approved = False
+        elif sys.stdin.isatty():
+            print("\n[!] Linux Data Guardian: metered hotspot active")
+            print(f"    Tool '{tool}' wants to download: {command_str}")
+            try:
+                approved = input("Approve download? (y/N): ").strip().lower() in ("y", "yes")
+            except (EOFError, KeyboardInterrupt):
                 approved = False
         else:
-            # Fallback to terminal prompt if stdin is interactive
-            if sys.stdin.isatty():
-                print(f"\n[!] Linux Data Guardian: Metered Hotspot Active")
-                print(f"Tool '{tool}' wants to download: {packages_summary}")
-                try:
-                    choice = input("Approve download? (y/N): ").strip().lower()
-                    approved = (choice in ("y", "yes"))
-                except (EOFError, KeyboardInterrupt):
-                    approved = False
-            else:
-                # Non-interactive without GUI -> fail closed
-                approved = False
+            approved = (on_timeout == "allow")
+            print(
+                f"[-] No interactive session; applying timeout_action={on_timeout!r} for {summary}",
+                file=sys.stderr,
+            )
 
-        # Record decision in database
-        decision_str = "approved" if approved else "denied"
-        self.db.record_approval_event(
-            tool=tool,
-            packages=packages_summary,
-            estimated_bytes=0,
-            decision=decision_str
-        )
+        self._record(tool, args, "approved" if approved else "denied")
 
-        # Notify desktop if denied
         if not approved and display and Path("/usr/bin/notify-send").exists():
-            subprocess.run([
-                "/usr/bin/notify-send",
-                "-u", "normal",
-                "Linux Data Guardian",
-                f"Download blocked for '{tool} {packages_summary}' to save mobile data."
-            ], check=False)
-
+            subprocess_run([
+                "/usr/bin/notify-send", "-u", "normal", "Linux Data Guardian",
+                f"Download blocked: {summary}",
+            ], timeout=5)
         return approved
 
 
+def subprocess_run(cmd: List[str], timeout: float) -> int:
+    import subprocess
+
+    return subprocess.run(cmd, timeout=timeout, check=False).returncode
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Data Guardian Universal Approval Gate",
-        add_help=False
-    )
-    parser.add_argument("--tool", required=True, help="Tool name (e.g. apt, pip, npm, cargo)")
+    parser = argparse.ArgumentParser(description="Data Guardian approval gate", add_help=False)
+    parser.add_argument("--tool", required=True)
+    parsed, remaining = parser.parse_known_args()
 
-    parsed, remaining_args = parser.parse_known_args()
     gate = ApprovalGate()
-
-    should_gate, reason = gate.should_gate(parsed.tool, remaining_args)
+    should_gate, reason = gate.should_gate(parsed.tool, remaining)
     if not should_gate:
-        # Pass through without prompt
         sys.exit(0)
 
-    # Prompt user
-    approved = gate.prompt_user(parsed.tool, remaining_args)
-    if approved:
-        print(f"[+] Data Guardian: Operation approved for {parsed.tool}.")
+    if gate.prompt_user(parsed.tool, remaining):
+        print(f"[+] Data Guardian: operation approved for {parsed.tool}.")
         sys.exit(0)
-    else:
-        print(f"[-] Data Guardian: Operation DENIED for {parsed.tool}. Cancelled to preserve data.")
-        sys.exit(1)
+    print(f"[-] Data Guardian: operation DENIED for {parsed.tool}.", file=sys.stderr)
+    sys.exit(1)
 
 
 if __name__ == "__main__":

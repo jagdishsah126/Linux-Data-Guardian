@@ -1,0 +1,29 @@
+[project]
+name = "linux-data-guardian"
+version = "2.0.0"
+description = "Local-first metered-data guardian for Linux (nftables + NetworkManager)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["PyYAML>=6.0"]
+# The application is deployed as a source tree by scripts/install.sh, so no
+# wheel metadata is published here. Runtime dependencies are system packages
+# (python3-gi, python3-yaml, nftables, network-manager).
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+    "error::DeprecationWarning:src.*",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

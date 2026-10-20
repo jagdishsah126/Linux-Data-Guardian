@@ -62,10 +62,15 @@ class InterfaceByteCounter:
         """
         iface = interface or self.target_interface
         if not iface:
-            # Fallback: pick the first non-loopback interface that has traffic
+            # Fallback: pick a physical-looking interface that has traffic.
+            # Virtual/container interfaces are excluded so container traffic is
+            # never billed to the mobile quota.
+            virtual_prefixes = ("lo", "docker", "veth", "br-", "virbr", "vmnet", "tun", "tap", "wg")
             all_ifaces = self.read_all_interfaces()
             for name, (rx, tx) in all_ifaces.items():
-                if name != "lo" and (rx > 0 or tx > 0):
+                if name.startswith(virtual_prefixes):
+                    continue
+                if rx > 0 or tx > 0:
                     iface = name
                     self.target_interface = name
                     break
@@ -78,7 +83,7 @@ class InterfaceByteCounter:
             return (0, 0, 0.0)
 
         rx_bytes, tx_bytes = all_readings[iface]
-        now = time.time()
+        now = time.monotonic()
 
         if iface not in self._last_readings:
             self._last_readings[iface] = (rx_bytes, tx_bytes, now)

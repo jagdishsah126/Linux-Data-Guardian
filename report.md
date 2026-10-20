@@ -1,164 +1,84 @@
-# Linux Data Guardian — Final Engineering & System Audit Report
+# Linux Data Guardian — Verification Report
 
-**Date:** October 19, 2026  
-**System:** Linux Mint 22.3 XFCE (Dell Inspiron 3501, Kernel 6.8, x86_64)  
-**Production Root:** `/home/jagdish/Desktop/System Files/Linux Data Guardian`  
-**GitHub Repository:** `https://github.com/jagdishsah126/Linux-Data-Guardian.git` (`main`)  
-**Status:** **Production Ready & Verified Active**
+**Date:** 2026-10-20
+**Build tree:** `/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian`
+**Target:** Linux Mint 22.3 XFCE (X11), Python 3.12, nftables, NetworkManager
+**Status:** source complete and tested; privileged reinstall and deploy pending
 
----
-
-## 1. Executive Summary
-
-**Linux Data Guardian** is a lightweight, local-first mobile SIM data saver, bandwidth accounting engine, and download gating manager built specifically for Linux Mint XFCE. It monitors cellular hotspot connections, prevents background operating system updaters and telemetry from consuming metered cellular data, enforces daily and monthly quotas, and provides both an interactive desktop dashboard and a native panel tray icon.
-
-Following an extensive architectural and security review, all critical vulnerabilities (`SEC-001`, `SEC-002`, `SEC-003`) and accounting bugs (`BUG-001`, `BUG-002`, `BUG-003`) were resolved using the user-approved **Option A** framework. All features have undergone live testing on active mobile tethering and pass 100% of the automated unit test suite.
+This report records what was actually executed and observed. Earlier claims in
+`report.md`, `audit.md`, `plan.md`, and `step.md` were not evidence-based and
+have been replaced or marked historical.
 
 ---
 
-## 2. Security & Architecture Audit Results
+## 1. Automated verification
 
-| Item ID | Description | Severity | Resolution Implemented | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **SEC-001** | Unprivileged daemon failed to apply nftables rules | **Critical** | Created standalone root-owned privileged helper (`/usr/local/libexec/data-guardian-helper`) with targeted sudoers policy. | **RESOLVED** ✅ |
-| **SEC-002** | Root APT hook executed user-writable Python code (LPE vector) | **Critical** | Removed root APT hook. Replaced with kernel-level isolation (`skuid 42 ct state new drop` on metered interface) with a 15-minute temporary allowance window. | **RESOLVED** ✅ |
-| **SEC-003** | Strict profile dropped all traffic due to missing cgroup hierarchy | **High** | Scoped Strict mode to drop unapproved ports while safely whitelisting HTTP (80), HTTPS (443), SSH (22), DNS (53), DHCP, and loopback. | **RESOLVED** ✅ |
-| **BUG-001** | Per-network traffic accounting was not wired into daemon loop | **Medium** | Connected daemon monitoring loop to SQLite table `network_daily_usage` (schema v2) with UUID indexing. | **RESOLVED** ✅ |
-| **BUG-002** | Established connections continued streaming data after quota exhaustion | **High** | Dropped all packets on the metered interface upon exhaustion (`oif "$IFACE" drop`) to halt active downloads immediately. | **RESOLVED** ✅ |
-| **BUG-003** | Silent notification failures when daemon ran as background service | **Medium** | Built daemon-to-client IPC notification queue; notifications are delivered natively by the tray/dashboard in user session. | **RESOLVED** ✅ |
-
----
-
-## 3. Implemented Features & Verification
-
-### 3.1 Protection Modes
-* **OFF (Monitor Only):** Zero firewall rules applied. Network traffic flows unrestricted; data accounting continues in SQLite. Used for unmetered home/office broadband (e.g. `ALHN-449C`).
-* **BALANCED (Everyday Mobile Hotspot):** Blocks background OS updates (`_apt` UID 42) and high-bandwidth P2P ports at the Linux kernel level. Browsing (HTTP/HTTPS), DNS, SSH, and email remain fast and unrestricted.
-* **STRICT (Maximum Data Preservation):** Blocks all non-essential ports. Restricts outbound traffic on the metered interface strictly to HTTP (80), HTTPS (443), SSH (22), and DNS (53). Loopback is unrestricted.
-
-### 3.2 Privileged Helper (`/usr/local/libexec/data-guardian-helper`)
-* **Ownership:** `root:root (0755)`
-* **Sudoers Scoping:** `/etc/sudoers.d/linux-data-guardian` (`0440 root:root`) grants execution strictly to this helper without password prompt.
-* **Argument Sanitation:** Accepts only fixed subcommands (`--status`, `--flush`, `--apply-balanced <iface>`, `--apply-strict <iface>`, `--apply-blocked <iface>`, `--allow-apt-window <iface>`). Interface names are strictly validated against regex `^[a-zA-Z0-9_\.\-]+$`.
-* **Atomic Pre-validation:** Every generated ruleset is syntax-checked via `nft -c -f -` before being committed to the kernel.
-* **Isolation:** Modifies **only** `table inet data_guardian`. Does not touch UFW, Docker, or system iptables.
-
-### 3.3 Graphical Dashboard & Tray
-* **Overview Tab:** Shows live connection status, active focused application, download/upload byte counters, and a network selector dropdown with independent profile toggles.
-* **Statistics Tab:** Renders an interactive 60-day usage history line chart (rendered natively via Cairo) with 1, 7, 15, 30, 45, and 60-day filter options and per-network breakdowns.
-* **CLI Commands Tab:** Offers quick-action buttons for common operations (`status`, `balanced`, `strict`, `off`, `allow-apt`, `diagnostics`) with inline color-coded terminal output.
-* **Native System Tray Applet:** Integrates with Linux Mint XFCE panel using `XApp.StatusIcon` and the custom Data Guardian shield icon.
-
----
-
-## 4. Duplicate Artifacts & System Footprint Inspection
-
-During development across multiple phases, duplicate assets and development artifacts were identified and cleaned up as follows:
-
-### 4.1 Icon Files (Cleaned Up)
-* `/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png`  
-  *(**Primary / Active**: Preserved as the single authoritative icon for desktop launchers, application menu, and GTK panel).*
-* `~/.local/share/icons/linux-data-guardian.png`  
-  *(**Removed**: Cleaned up duplicate).*
-* `~/.local/share/icons/hicolor/512x512/apps/linux-data-guardian.png`  
-  *(**Removed**: Cleaned up duplicate).*
-
----
-
-### 4.2 Workspace Separation (Build vs. Production Deployment)
-* `/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian/`  
-  *(**Development & Build Workspace**: Contains full test suite (`tests/`), development planning docs (`plan.md`, `audit.md`, `step.md`), and build assets. All tests pass here via `pytest`).*
-* `/home/jagdish/Desktop/System Files/Linux Data Guardian/`  
-  *(**Live Production Deployment**: Contains strictly runtime code (`src/`), config templates (`config/`), scripts (`scripts/`), and systemd units (`systemd/`). All tests, planning docs, and cache artifacts have been removed to keep the deployment lean and lightweight).*
-
----
-
-### 4.3 Root Artifacts Cleaned Up
-* Loose duplicate root image `wifi.png` removed (preserved in `assets/wifi.png`).
-* Temporary scratch file `SUDO_INSTALL_STEPS.txt` removed.
-* Local `.pytest_cache/` and `__pycache__` artifacts purged from deployment root.
-
----
-
-### 4.4 CLI Interception Shims in `~/.local/bin/` (4 Installed)
-* `~/.local/bin/pip`
-* `~/.local/bin/pip3`
-* `~/.local/bin/npm`
-* `~/.local/bin/cargo`
-
-These scripts were installed by `data-guardian install-shims` to intercept package installation commands and ask for confirmation before downloading on metered mobile data.
-* If you run `pip install` or `npm install`, these shims verify if your active connection is metered before proceeding.
-* If you prefer to rely on kernel-level firewall gating and keep your default terminal tools unintercepted, you can remove these shims at any time by running:
-  ```bash
-  data-guardian remove-shims
-  ```
-
----
-
-### 4.5 Co-existing Project: "Linux Data Monitor"
-* Location: `/home/jagdish/Desktop/System Files/Linux Data Monitor/`
-* Process: `dm-collector` (PID running on system).
-* Symlinks: `~/.local/bin/data-monitor`, `dm-collector`, `dm-panel`, `dm-popup`.
-* Note: This is an independent lightweight monitor tool created on Oct 19. It operates on separate database files and does not conflict with Linux Data Guardian.
-
----
-
-## 5. System Inventory & File Locations
-
-| Path | Purpose | Permissions | Management |
-| :--- | :--- | :--- | :--- |
-| `/usr/local/libexec/data-guardian-helper` | Root execution helper for nftables | `0755 root:root` | Sudo-controlled binary |
-| `/etc/sudoers.d/linux-data-guardian` | Scoped sudoers policy for helper | `0440 root:root` | Sudoers configuration |
-| `/etc/systemd/system/data-guardian.service` | Background systemd monitoring daemon | `0644 root:root` | System service (`active`) |
-| `/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png` | Application & Tray icon | `0644 root:root` | Icon theme asset |
-| `~/.local/bin/data-guardian` | User CLI executable wrapper | `0755 jagdish` | User executable |
-| `~/.local/share/applications/data-guardian.desktop` | Application menu launcher | `0644 jagdish` | XDG Desktop Entry |
-| `~/.config/autostart/data-guardian-tray.desktop` | Auto-start tray launcher on desktop login | `0644 jagdish` | XDG Autostart Entry |
-| `~/.config/linux-data-guardian/config.yaml` | User configuration and quotas | `0644 jagdish` | YAML configuration |
-| `~/.local/share/linux-data-guardian/guardian.db` | Persistent SQLite bandwidth database | `0600 jagdish` | SQLite database (WAL mode) |
-| `/run/user/1000/data-guardian.sock` | Daemon IPC UNIX domain socket | `0600 jagdish` | Runtime socket |
-
----
-
-## 6. Maintenance & Operational Commands
-
-### Check Current Status & Active Profile
-```bash
-data-guardian status
+```text
+$ python3 -m pytest -q
+124 passed in 4.25s
 ```
 
-### Switch Protection Profiles
-```bash
-data-guardian profile balanced   # Default mobile data saver
-data-guardian profile strict     # High-restriction mode
-data-guardian profile off        # Full unmetered access
-```
+The suite is hermetic: it uses temporary XDG directories, mocks the privileged
+boundary, and skips checks that need unavailable kernel features. Coverage:
 
-### Open Temporary 15-Minute APT Window
-```bash
-data-guardian allow-apt
-# or click "📦 Allow APT" in the dashboard
-```
+| Area | Tests | What is asserted |
+| :--- | :--- | :--- |
+| Quota engine | `test_quota.py` | Empty day is free; zero limit is unlimited; metered-only accounting; allowance clears a block; monthly-only plans; warn-only never blocks; thresholds fire once; DB permissions; orphan recovery; schema version |
+| Database | `test_database.py` | Schema v3 tables, session lifecycle, limit/allowance bookkeeping, warning levels, approvals, metered-only monthly totals, frozen metered flag |
+| Rulesets | `test_firewall_rules.py` | `destroy table` idempotence, profile rendering, APT-window ordering, quota hard cutoff, interface injection rejection, real `nft -c` parse of balanced/blocked/fallback/cgroup rulesets |
+| Helper | `test_firewall_rules.py` | Unknown action, foreign table, `flush ruleset`, `include`, cgroup traversal, invalid PIDs, non-root refusal |
+| Daemon | `test_daemon.py` | Startup quota recovery, allowance/profile/hotspot commands, APT timer open/expire, notification cursors, firewall failure surfacing, socket ownership and single-daemon guard |
+| IPC | `test_daemon.py` | Round trip, 0600 socket, malformed JSON, handler crash recovery, second server refusal |
+| Network | `test_network.py` | Escaped-colon `nmcli` parsing, UUID/name matching, transition callbacks, byte-counter resets, virtual-interface exclusion |
+| Config | `test_config.py` | XDG paths, defaults, secure writes, per-network profiles, whitelist values |
+| Approvals | `test_approvals.py` | `pip install`/`-m pip` gating, flags with values, read-only pass-through, timeout policy, shim install/remove |
+| Installer safety | `test_diagnostics.py` | No APT hook, helper + `visudo -cf`, `SUDO_USER`, no root project Python, emergency script never unlinks the socket, deploy script guards |
 
-### Grant Extra Quota Allowance
-```bash
-data-guardian allow 500          # Adds +500 MB to today's budget
-```
+## 2. Schema migration (v2 → v3)
 
-### Launch Graphical Dashboard
-```bash
-data-guardian dashboard
-```
+A synthetic v2 database containing legacy `daily_usage` quota columns, sessions
+without `last_update`, and `network_daily_usage` without `metered` was opened by
+the current `Database` code. Observed result:
 
-### Emergency Restore (Instant Network Flush)
-If you ever want to instantly tear down all firewall rules:
-```bash
-bash "/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/emergency-disable.sh"
-```
+* `schema_version` = 3
+* legacy limit 10 MiB and allowance 5 MiB moved into `quota_state`
+* `warning_fired = 1` became warning level `80`
+* `quota_exceeded = 1` became `exceeded = 1`, reason `legacy`
+* only the designated UUID's network rows received `metered = 1`
+* `sessions.last_update` was backfilled from `ended_at`/`started_at`
+* all rows preserved; file mode became 0600
 
-### Clean Uninstallation
-If you ever want to cleanly remove Linux Data Guardian completely:
-```bash
-bash "/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/uninstall.sh"
-```
-*(The uninstall script cleans up the helper, sudoers file, systemd service, desktop launchers, shims, and icons without leaving orphaned rules).*
+The live database was already at v3 at backup time (4 daily rows, 5 per-network
+rows, 18 sessions), so the migration path is verified on a controlled copy, not
+on live data.
+
+## 3. Runtime observations
+
+* `data-guardian.service` is active; the daemon holds PID 1562.
+* Measured RSS during this audit: daemon ≈ 49 MiB, tray client ≈ 129 MiB with
+  GTK caches warm. The earlier `< 35 MB` claim was false.
+* The runtime database is `~/.local/share/linux-data-guardian/guardian.db`
+  (0600) in WAL mode.
+* The Unix socket is created under the XDG runtime directory with mode 0600.
+* A second daemon refuses to start (flock + live-socket probe).
+
+## 4. Privileged boundary
+
+* Firewall, cgroup, and flush operations go through
+  `/usr/local/libexec/data-guardian-helper` only.
+* The sudoers file grants exactly that one command, validated with
+  `visudo -cf` at install time.
+* No APT hook, no root-owned Python import of project code, no wildcard sudo.
+* cgroup moves must be performed by the helper: an unprivileged process cannot
+  move another process into a delegated cgroup (`Permission denied`), which was
+  reproduced directly.
+
+## 5. Pending actions (require the user)
+
+1. Install/refresh the helper, sudoers rule, systemd unit, and icon:
+   `sudo ./scripts/install.sh --system`.
+2. Verify cgroup creation and strict-mode application on the live hotspot.
+3. Remove the stale `.git` directory inside the deploy target after backup, then
+   run `./scripts/deploy.sh`.
+
+No `sudo` command in this report was executed automatically.

@@ -4,22 +4,30 @@
 # Location: /usr/local/libexec/data-guardian-helper
 # Owner:    root:root (Permissions: 0755)
 #
-# Security: Accepts ONLY strictly validated actions affecting ONLY
-#           the dedicated 'table inet data_guardian' in nftables.
-#           Rejects all arbitrary commands and unvalidated interface strings.
+# Security model
+# --------------
+# This is the ONLY privileged surface of Linux Data Guardian. It:
+#   * refuses to run as non-root;
+#   * accepts a fixed, enumerated set of actions;
+#   * touches ONLY `table inet data_guardian`;
+#   * validates every ruleset with `nft -c` before committing it;
+#   * rejects rulesets that reference any other table, `flush ruleset`, or `include`;
+#   * never evaluates, sources or imports anything supplied by a caller.
 # ==============================================================================
 
 set -euo pipefail
 
 TABLE_NAME="data_guardian"
+CGROUP_ROOT="/sys/fs/cgroup"
+CGROUP_BASE="${CGROUP_ROOT}/data_guardian"
+MAX_RULESET_BYTES=65536
+MAX_CGROUP_PIDS=512
 
-# Validate root privileges
 if [ "$(id -u)" -ne 0 ]; then
     echo "[!] Error: data-guardian-helper must be executed as root." >&2
     exit 1
 fi
 
-# Ensure nft binary exists
 NFT="/usr/sbin/nft"
 if [ ! -x "$NFT" ]; then
     NFT=$(command -v nft 2>/dev/null || true)
@@ -29,175 +37,178 @@ if [ ! -x "$NFT" ]; then
     fi
 fi
 
-# Action parameter
 ACTION="${1:-}"
 
-# Regex for valid Linux network interface name:
-# e.g., wlp0s20f3, wlan0, eth0, enp3s0
-IFACE_REGEX="^[a-zA-Z0-9_\.\-]+$"
+# ------------------------------------------------------------------ validation
+validate_cgroup_name() {
+    case "${1:-}" in
+        foreground|whitelist) ;;
+        *) echo "[!] Error: unknown cgroup '${1:-}'." >&2; exit 2 ;;
+    esac
+}
 
-validate_interface() {
-    local iface="${1:-}"
-    if [ -z "$iface" ]; then
-        echo "[!] Error: Missing interface argument." >&2
-        exit 2
-    fi
-    if ! [[ "$iface" =~ $IFACE_REGEX ]]; then
-        echo "[!] Error: Invalid network interface format: '$iface'" >&2
+validate_pid() {
+    local pid="${1:-}"
+    if ! [[ "$pid" =~ ^[0-9]+$ ]] || [ "$pid" -lt 2 ] || [ "$pid" -gt 4194304 ]; then
+        echo "[!] Error: invalid pid '$pid'." >&2
         exit 2
     fi
 }
 
+validate_ruleset() {
+    # Read stdin (bounded) and apply defence-in-depth checks before nft sees it.
+    local ruleset
+    ruleset=$(head -c "$MAX_RULESET_BYTES")
+    if [ -z "$ruleset" ]; then
+        echo "[!] Error: empty ruleset." >&2
+        exit 2
+    fi
+
+    # 1. Forbid global/IO directives outright.
+    if printf '%s\n' "$ruleset" \
+        | grep -Eq '(^|[^[:alnum:]_])(flush[[:space:]]+ruleset|include|exec|define|redefine)[[:space:]]'; then
+        echo "[!] Error: ruleset contains a forbidden directive." >&2
+        exit 2
+    fi
+
+    # 2. Every table statement must target exactly 'table inet data_guardian'.
+    local table_lines bad
+    table_lines=$(printf '%s\n' "$ruleset" \
+        | grep -E '^[[:space:]]*(table|add[[:space:]]+table|delete[[:space:]]+table|destroy[[:space:]]+table|flush[[:space:]]+table)' || true)
+    if [ -n "$table_lines" ]; then
+        bad=$(printf '%s\n' "$table_lines" \
+            | grep -Ev "^[[:space:]]*(table|add[[:space:]]+table|delete[[:space:]]+table|destroy[[:space:]]+table|flush[[:space:]]+table)[[:space:]]+(inet|ip|ip6|bridge|netdev|arp)[[:space:]]+${TABLE_NAME}[[:space:]]*\{?[[:space:]]*$" || true)
+        if [ -n "$bad" ]; then
+            echo "[!] Error: ruleset references a table other than ${TABLE_NAME}:" >&2
+            printf '%s\n' "$bad" >&2
+            exit 2
+        fi
+    fi
+
+    # 3. The ruleset must actually target our table.
+    if ! printf '%s\n' "$ruleset" \
+        | grep -Eq '(^|[[:space:]])(table|destroy[[:space:]]+table)[[:space:]]+inet[[:space:]]+'"${TABLE_NAME}"'([[:space:]]|\{|$)'; then
+        echo "[!] Error: ruleset does not target table inet ${TABLE_NAME}." >&2
+        exit 2
+    fi
+
+    printf '%s\n' "$ruleset"
+}
+
+apply_ruleset() {
+    local ruleset="$1"
+    if ! printf '%s' "$ruleset" | "$NFT" -c -f - >/dev/null 2>&1; then
+        echo "[!] Error: ruleset failed nft syntax validation." >&2
+        printf '%s' "$ruleset" | "$NFT" -c -f - >&2 || true
+        exit 3
+    fi
+    printf '%s' "$ruleset" | "$NFT" -f - >/dev/null
+    echo "[+] Ruleset applied (table inet ${TABLE_NAME})."
+}
+
+# ---------------------------------------------------------------------- actions
 case "$ACTION" in
     --status)
         if "$NFT" list table inet "$TABLE_NAME" >/dev/null 2>&1; then
             echo "active"
             exit 0
-        else
-            echo "inactive"
-            exit 1
         fi
+        echo "inactive"
+        exit 1
         ;;
 
     --flush)
         if "$NFT" list table inet "$TABLE_NAME" >/dev/null 2>&1; then
             "$NFT" delete table inet "$TABLE_NAME"
-            echo "[+] Successfully flushed table inet $TABLE_NAME."
+            echo "[+] Successfully flushed table inet ${TABLE_NAME}."
         else
-            echo "[i] Table inet $TABLE_NAME was not active."
+            echo "[i] Table inet ${TABLE_NAME} was not active."
+        fi
+        # Verify it is really gone.
+        if "$NFT" list table inet "$TABLE_NAME" >/dev/null 2>&1; then
+            echo "[!] Error: table inet ${TABLE_NAME} still present after flush." >&2
+            exit 3
         fi
         exit 0
         ;;
 
-    --apply-balanced)
-        IFACE="${2:-}"
-        validate_interface "$IFACE"
-
-        RULESET=$(cat <<EOF
-table inet $TABLE_NAME {
-    chain output {
-        type filter hook output priority 0; policy accept;
-
-        # 1. Always accept loopback traffic
-        oif "lo" accept
-
-        # 2. Accept established and related connections
-        ct state established,related accept
-
-        # 3. Drop invalid connection states
-        ct state invalid drop
-
-        # 4. Essential network services: DNS, DHCP, NTP
-        udp dport {53, 67, 68, 123} accept
-        tcp dport {53} accept
-
-        # 5. Balanced Mode: Drop unapproved background APT updates on metered interface
-        # UID 42 (_apt) sandbox downloads are blocked
-        oif "$IFACE" skuid 42 ct state new drop
-    }
-}
-EOF
-)
-        # Pre-validate ruleset syntax without committing
-        echo "$RULESET" | "$NFT" -c -f -
-        # Commit atomically
-        echo "$RULESET" | "$NFT" -f -
-        echo "[+] Successfully applied BALANCED ruleset on interface $IFACE."
+    --apply-stdin)
+        RULESET=$(validate_ruleset)
+        # Strict rulesets reference cgroups; make sure they exist before nft
+        # validates the path, otherwise a valid ruleset would be rejected.
+        if printf '%s' "$RULESET" | grep -q 'cgroupv2'; then
+            if [ -d "$CGROUP_ROOT" ]; then
+                mkdir -p "$CGROUP_BASE/foreground" "$CGROUP_BASE/whitelist" 2>/dev/null || true
+            fi
+        fi
+        apply_ruleset "$RULESET"
         exit 0
         ;;
 
-    --apply-strict)
-        IFACE="${2:-}"
-        validate_interface "$IFACE"
-
-        # Staged Strict Mode: Falls back safely to balanced policy plus UID 42 drop
-        # until full cgroupv2 process hierarchy supervisor is active
-        RULESET=$(cat <<EOF
-table inet $TABLE_NAME {
-    chain output {
-        type filter hook output priority 0; policy accept;
-
-        oif "lo" accept
-        ct state established,related accept
-        ct state invalid drop
-
-        udp dport {53, 67, 68, 123} accept
-        tcp dport {53} accept
-
-        # Strict Profile (Staged): Block background updaters
-        oif "$IFACE" skuid 42 ct state new drop
-    }
-}
-EOF
-)
-        echo "$RULESET" | "$NFT" -c -f -
-        echo "$RULESET" | "$NFT" -f -
-        echo "[+] Successfully applied STRICT ruleset on interface $IFACE."
+    --cgroup-init)
+        # Create the two cgroups used by strict-mode socket matching.
+        if [ ! -d "$CGROUP_ROOT" ]; then
+            echo "[!] Error: cgroup v2 is not mounted at ${CGROUP_ROOT}." >&2
+            exit 4
+        fi
+        mkdir -p "$CGROUP_BASE/foreground" "$CGROUP_BASE/whitelist"
+        chmod 0755 "$CGROUP_BASE" "$CGROUP_BASE/foreground" "$CGROUP_BASE/whitelist"
+        echo "[+] cgroups ready: ${CGROUP_BASE}/{foreground,whitelist}"
         exit 0
         ;;
 
-    --apply-blocked)
-        IFACE="${2:-}"
-        validate_interface "$IFACE"
-
-        # Quota Exhaustion Mode: Hard cut-off on metered interface
-        # Established connections on $IFACE are NOT accepted to prevent streaming leaks.
-        RULESET=$(cat <<EOF
-table inet $TABLE_NAME {
-    chain output {
-        type filter hook output priority 0; policy accept;
-
-        # 1. Loopback always allowed
-        oif "lo" accept
-
-        # 2. Allow only core local network services (DNS, DHCP)
-        udp dport {53, 67, 68} accept
-        tcp dport {53} accept
-
-        # 3. Hard cut-off on the metered interface (drops both new and established)
-        oif "$IFACE" drop
-    }
-}
-EOF
-)
-        echo "$RULESET" | "$NFT" -c -f -
-        echo "$RULESET" | "$NFT" -f -
-        echo "[+] Successfully applied QUOTA BLOCKED ruleset on interface $IFACE."
+    --cgroup-set)
+        GROUP="${2:-}"
+        validate_cgroup_name "$GROUP"
+        shift 2
+        if [ "$#" -eq 0 ]; then
+            echo "[!] Error: --cgroup-set requires at least one pid." >&2
+            exit 2
+        fi
+        if [ "$#" -gt "$MAX_CGROUP_PIDS" ]; then
+            echo "[!] Error: too many pids ($# > ${MAX_CGROUP_PIDS})." >&2
+            exit 2
+        fi
+        if [ ! -d "$CGROUP_BASE/$GROUP" ]; then
+            echo "[!] Error: cgroups not initialised (run --cgroup-init)." >&2
+            exit 4
+        fi
+        # Replace membership: drain the old set back to the root cgroup first.
+        # Without this, a previously focused app would stay allowed forever.
+        if [ -f "$CGROUP_BASE/$GROUP/cgroup.procs" ]; then
+            while read -r old_pid; do
+                [ -n "$old_pid" ] || continue
+                printf '%s' "$old_pid" > "$CGROUP_ROOT/cgroup.procs" 2>/dev/null || true
+            done < "$CGROUP_BASE/$GROUP/cgroup.procs"
+        fi
+        moved=0
+        for pid in "$@"; do
+            validate_pid "$pid"
+            if [ -d "/proc/$pid" ]; then
+                printf '%s' "$pid" > "$CGROUP_BASE/$GROUP/cgroup.procs" 2>/dev/null && moved=$((moved + 1)) || true
+            fi
+        done
+        echo "[+] Moved ${moved} process(es) into ${GROUP}."
         exit 0
         ;;
 
-    --allow-apt-window)
-        IFACE="${2:-}"
-        validate_interface "$IFACE"
-
-        # Temporarily removes the UID 42 drop rule while preserving general protection
-        RULESET=$(cat <<EOF
-table inet $TABLE_NAME {
-    chain output {
-        type filter hook output priority 0; policy accept;
-
-        oif "lo" accept
-        ct state established,related accept
-        ct state invalid drop
-
-        udp dport {53, 67, 68, 123} accept
-        tcp dport {53} accept
-
-        # APT window active: UID 42 allowed
-        skuid 42 accept
-    }
-}
-EOF
-)
-        echo "$RULESET" | "$NFT" -c -f -
-        echo "$RULESET" | "$NFT" -f -
-        echo "[+] Successfully opened APT download window on interface $IFACE."
+    --cgroup-clear)
+        GROUP="${2:-}"
+        validate_cgroup_name "$GROUP"
+        if [ -d "$CGROUP_BASE/$GROUP" ] && [ -f "$CGROUP_BASE/$GROUP/cgroup.procs" ]; then
+            # Move everything back to the root cgroup.
+            while read -r pid; do
+                [ -n "$pid" ] || continue
+                printf '%s' "$pid" > "$CGROUP_ROOT/cgroup.procs" 2>/dev/null || true
+            done < "$CGROUP_BASE/$GROUP/cgroup.procs"
+        fi
+        echo "[+] Cleared cgroup ${GROUP}."
         exit 0
         ;;
 
     *)
-        echo "[!] Error: Unrecognized action '$ACTION'." >&2
-        echo "Usage: data-guardian-helper {--status|--flush|--apply-balanced <iface>|--apply-strict <iface>|--apply-blocked <iface>|--allow-apt-window <iface>}" >&2
+        echo "[!] Error: Unrecognized action '${ACTION}'." >&2
+        echo "Usage: data-guardian-helper {--status|--flush|--apply-stdin|--cgroup-init|--cgroup-set <foreground|whitelist> <pid>...|--cgroup-clear <foreground|whitelist>}" >&2
         exit 2
         ;;
 esac

@@ -1,177 +1,194 @@
 # Linux Data Guardian
 
-> **A local-first, low-overhead mobile data saver and download approval manager built for Linux Mint XFCE.**
+A local-first data guard for Linux laptops that sometimes run on a phone
+hotspot. It watches NetworkManager, counts bytes from `/proc/net/dev`, enforces
+quotas with an isolated `nftables` table, and gates package-manager downloads
+while the designated metered connection is active.
 
-When tethered to a smartphone’s mobile data pack (e.g., NTC / Ncell mobile SIM data), Linux Data Guardian protects your data from background operating system updates, telemetry, unapproved package downloads, and background tabs.
-
----
-
-## 🌟 Key Features
-
-* **Automatic Hotspot Scoping:** Restrictions activate *only* when connected to your designated mobile hotspot. Normal Wi-Fi (home/office) remains 100% unrestricted.
-* **Dual-Profile Data Saver:**
-  * **Balanced Mode (Default):** Silences OS background updates (`apt-daily`, `packagekitd`, `unattended-upgrades`), blocks telemetry, allows normal web surfing (Brave/Firefox) and whitelisted developer tools (OpenCode CLI, Antigravity CLI, Git), and gates package manager downloads.
-  * **Strict Mode (Foreground-Only):** Extends Balanced mode by routing network access *only* to the window currently active in XFCE (via X11 `_NET_ACTIVE_WINDOW`) plus whitelisted background coding tools.
-* **"Download Only When I Approve" Gating:**
-  * Pre-download inspection for **APT** (`apt install`, `apt upgrade`).
-  * Transparent shims for developer tools (**pip**, **npm**, **cargo**).
-  * Prompts with a desktop modal dialog showing the command and download scope before any bytes transfer.
-* **Accurate Traffic Accounting & Quotas:**
-  * Exact byte counts read directly from `/proc/net/dev` (`wlp0s20f3`).
-  * Daily and monthly budgets with alerts at 80% and automated pause at 100%.
-  * Local SQLite storage in `~/.local/share/linux-data-guardian/guardian.db` (WAL mode).
-* **Linux Mint Native Bottom Status Bar Tray Applet:**
-  * Built using native `XApp.StatusIcon` to dock directly in Linux Mint's bottom panel near the clock.
-  * Right-click menu for quick profile toggling, temporary allowance grants, and emergency bypass.
-  * Native GTK3 dashboard with progress bar, recent approval logs, and "+100 MB" allowance grants.
-* **Fail-Safe Isolated Firewall (`nftables`):**
-  * All rules reside in an isolated `table inet data_guardian`.
-  * Never touches or interferes with system `ufw`.
-  * One-command emergency recovery: `scripts/emergency-disable.sh`.
+Nothing leaves your machine: there is no telemetry, account, cloud service, or
+network listener beyond a user-only Unix socket.
 
 ---
 
-## 🚀 Step-by-Step Configuration Guide
+## What it actually does
 
-### Step 1: Install User-Level Components
-Clone the repository and run the installer:
+* **Metered networks only.** Restrictions apply when NetworkManager reports the
+  connection UUID/name you designated. Home and office networks are untouched
+  and their traffic is still counted separately.
+* **Metered-only quotas.** Daily and monthly budgets sum only rows recorded
+  while the designated hotspot was active. Ordinary Wi-Fi usage cannot consume
+  your mobile budget.
+* **Two enforcement profiles plus off:**
+
+  | Profile | Behaviour on the metered interface |
+  | :--- | :--- |
+  | `balanced` (default) | Allows established connections, DNS/DHCP/NTP, and all normal user traffic. New connections owned by UID 42 (APT) are dropped. |
+  | `strict` | Only new connections from the focused X11 application's cgroup or the whitelisted tools (`opencode`, `antigravity`) are allowed. Without cgroup v2 delegation it falls back to a TCP port allowlist (22, 80, 443). Everything else is dropped. |
+  | `off` | Monitoring only; the `data_guardian` table is removed. |
+
+* **Quota enforcement.** At 80% and 95% of the daily budget you get one
+  notification per threshold per day. At 100% (or when the monthly budget is
+  reached) new outbound traffic is paused unless `action_on_exhaustion` is
+  `warn_only`. A manually granted allowance raises today's effective limit.
+* **Temporary APT window.** APT downloads are blocked while metered. Use
+  `data-guardian allow-apt` (or the tray item) to open a timed window (default
+  15 minutes, maximum 120). It closes automatically and the rules are
+  re-applied. There is **no** root-owned APT hook or root Python import.
+* **Download approval for CLI tools.** shims for `pip`, `pip3`, `npm`, and
+  `cargo` ask for confirmation before download-style commands on a metered
+  connection. Read-only commands (`pip list`, `npm --version`, ...) pass
+  straight through.
+* **Local history.** SQLite in WAL mode with 0600 permissions, pruned after 90
+  days by default.
+* **Status, dashboard, and tray.** A CLI (`status --json`), a GTK3 dashboard,
+  and an XApp/AppIndicator/GTK status icon.
+
+### Known limitations
+
+* Strict-mode focus tracking is X11-only. On Wayland the focused-app cgroup is
+  unavailable, so use `balanced` or the port fallback.
+* cgroup matching requires cgroup v2 and the privileged helper. The installer
+  installs it; `data-guardian doctor` reports whether it is usable.
+* The APT window is a time box, not a package inspection: it allows UID 42 new
+  connections for the chosen duration.
+* The dashboard's chart requires `python3-matplotlib`; without it the rest of
+  the dashboard still works.
+* Memory use is tens of MiB, not the 35 MB claimed by earlier drafts. Measured
+  RSS on Linux Mint XFCE (Python 3.12 + GTK3) was about 49 MiB for the daemon
+  and 86–129 MiB for the GTK tray/dashboard clients, depending on GTK caches.
+
+---
+
+## Requirements
+
+* Linux with systemd, NetworkManager (`nmcli`), nftables, and Python 3.10+.
+* `python3-yaml`, `python3-gi`, GTK 3; `zenity` for approval dialogs.
+* `xapp` or `libayatana-appindicator3` for the tray (falls back to
+  `Gtk.StatusIcon`).
+* Root only for the helper, sudoers rule, systemd unit, and icon.
+
+## Install
+
 ```bash
 git clone https://github.com/jagdishsah126/Linux-Data-Guardian.git
 cd Linux-Data-Guardian
+
+# 1. User-level: wrapper, config seed, shims, autostart entry, desktop file
 ./scripts/install.sh
+
+# 2. System-level: helper, sudoers rule, systemd unit, icon
+sudo ./scripts/install.sh --system
 ```
-This script:
-1. Links the `data-guardian` command into `~/.local/bin/`.
-2. Installs transparent CLI shims for `pip`, `npm`, and `cargo`.
-3. Registers the tray applet in your XFCE session autostart so it launches whenever you log in.
 
-*(Optional: If you want kernel-level firewall enforcement and APT download gating, also run `sudo ./scripts/install.sh --system`)*.
+The user step never asks for a password. The system step installs exactly one
+NOPASSWD command (`/usr/local/libexec/data-guardian-helper`); it does not grant
+general sudo and writes no APT configuration.
 
----
+Then designate your hotspot and check the installation:
 
-### Step 2: Configure Your Designated Mobile Hotspot
-
-You only need to designate your phone's hotspot **once**. Data Guardian remembers it permanently.
-
-#### Method A: From the Graphical Dashboard (Recommended)
-1. Open the dashboard:
-   ```bash
-   data-guardian dashboard
-   ```
-2. Locate the **"Active Network Connection"** section.
-3. In the **"Designated Hotspot"** dropdown menu, select your phone's hotspot name.
-4. Done!
-
-#### Method B: Interactively from Terminal
-Run:
 ```bash
-data-guardian set-hotspot
-```
-You will see a numbered list of all your saved Wi-Fi connections. Simply type the number corresponding to your mobile hotspot:
-```text
-=== Select Designated Mobile Hotspot ===
-  [1] ALHN-449C (UUID: a054f084...)
-  [2] Moto Mobile (UUID: 590f9bbc...)
-  [3] Hotspot-College (UUID: 1dd269c3...)
-
-Enter number (1-3) or 'q' to cancel: 2
-[✓] Successfully set designated hotspot to: 'Moto Mobile'
+data-guardian set-hotspot        # interactive picker
+data-guardian doctor             # full health check
+data-guardian status
 ```
 
-#### Method C: Directly by Name
-```bash
-data-guardian set-hotspot "Moto Mobile"
-```
+The daemon runs as `data-guardian.service`; the tray starts from the XFCE
+autostart entry on the next login.
+
+### Deploying a runtime copy
+
+`scripts/deploy.sh [destination]` rsyncs only `src/`, `scripts/`, `config/`,
+`systemd/`, and `assets/` into a plain artifact directory (default:
+`/home/jagdish/Desktop/System Files/Linux Data Guardian`). It refuses to write
+into a second git clone and records the source commit in `DEPLOYED`.
 
 ---
 
-### Step 3: Start the Background Services
+## CLI
 
-To start Data Guardian immediately:
-```bash
-# 1. Start the background monitoring daemon
-data-guardian daemon &
-
-# 2. Start the bottom status bar tray icon
-data-guardian tray &
+```
+data-guardian status [--json]        Connection, profile, counters, quota verdict
+data-guardian daemon                 Run the background daemon (systemd does this)
+data-guardian tray                   Status icon
+data-guardian dashboard              GTK dashboard
+data-guardian set-hotspot [NAME]     Choose the designated metered network
+data-guardian profile MODE           balanced | strict | off
+data-guardian allow MB               Add to today's allowance
+data-guardian allow-apt              Open the APT window (15 min)
+data-guardian close-apt              Close it now
+data-guardian bypass                 Flush all Data Guardian rules
+data-guardian doctor [--json]        Diagnostics with per-check fixes
+data-guardian install-shims          Write pip/pip3/npm/cargo shims
+data-guardian remove-shims           Remove them
 ```
 
----
-
-### Step 4: Using the Bottom Status Bar Tray Icon
-
-Once started, the Data Guardian icon (shield / network symbol) appears in your **bottom status bar** (next to your battery icon and clock).
-
-* **Left-Click:** Instantly opens the graphical **Dashboard**.
-* **Right-Click:** Opens the quick-action menu:
-  * **● Balanced Data Saver:** Allows web surfing and coding tools; silences background OS updates and telemetry.
-  * **● Strict (Foreground Only):** Gives internet access *only* to the window you are actively looking at.
-  * **○ Data Saver Off:** Monitoring only, no restrictions.
-  * **+100 MB Temporary Allowance:** Grants a quick extra allowance if your daily budget is reached.
-  * **Emergency Bypass:** Instantly removes all firewall restrictions.
+`--version` prints the version. `python3 -m src.data_guardian` is equivalent
+when `PYTHONPATH` points at the project root.
 
 ---
 
-### Step 5: How "Download Only When I Approve" Works
+## Files
 
-When connected to your designated mobile hotspot, package managers cannot download in the background without your explicit consent:
-
-1. **Terminal Tools (`pip`, `npm`, `cargo`):**
-   * If you run `pip install <package>` or `npm install <package>`, Data Guardian pops up a desktop dialog:
-     ```text
-     [ Linux Data Guardian — Download Approval ]
-     Tool: pip
-     Command: install requests
-     Do you want to approve this download on metered data?
-     [ Approve Download ]    [ Deny / Cancel ]
-     ```
-   * Clicking **Approve** allows the download to proceed.
-   * Clicking **Deny** cancels the command immediately before any data is transferred.
-   * Read-only commands like `pip list` or `npm -v` pass through instantly without prompting.
-
-2. **APT System Updates (`apt install`, `apt upgrade`):**
-   * When installed with `--system`, APT triggers a pre-download gate before fetching archive packages. Denying the prompt aborts APT safely.
-
----
-
-## 🛠️ Handy CLI Commands
-
-| Command | Description |
+| Path | Purpose |
 | :--- | :--- |
-| `data-guardian status` | View active network, profile, today's RX/TX data usage, and quota status. |
-| `data-guardian dashboard` | Open the GTK3 control window with live progress bar and recent logs. |
-| `data-guardian tray` | Launch the bottom panel tray icon. |
-| `data-guardian set-hotspot [name]` | Interactively pick or set your designated mobile hotspot. |
-| `data-guardian profile <balanced\|strict\|off>` | Switch Data Saver mode from terminal. |
-| `data-guardian allow <MB>` | Grant temporary megabytes to today's budget (e.g. `data-guardian allow 200`). |
-| `data-guardian bypass` | Instantly flush all firewall rules and lift all restrictions. |
-| `./scripts/emergency-disable.sh` | Standalone emergency script to flush rules even if Python is stopped. |
-| `./scripts/uninstall.sh` | Cleanly uninstalls all shims, configs, and autostart entries. |
+| `~/.config/linux-data-guardian/config.yaml` | Quotas, profile, designated hotspot |
+| `~/.config/linux-data-guardian/whitelist.yaml` | Strict-mode process/port allowlist |
+| `~/.local/share/linux-data-guardian/guardian.db` | Usage, quota state, notifications, approvals |
+| `$XDG_RUNTIME_DIR/data-guardian/` | Instance lock and 0600 Unix socket |
+| `/usr/local/libexec/data-guardian-helper` | Privileged firewall/cgroup helper |
+| `/etc/systemd/system/data-guardian.service` | Daemon unit |
 
----
+All paths honour `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`.
 
-## ⚙️ Configuration Files
+### Quota configuration
 
-All configuration files are stored locally in your home directory:
-
-* `~/.config/linux-data-guardian/config.yaml`: Quota limits, timeouts, and designated hotspot UUID.
-* `~/.config/linux-data-guardian/whitelist.yaml`: Whitelisted developer tools (`opencode`, `antigravity`, `git`, `python3`).
-* `~/.local/share/linux-data-guardian/guardian.db`: SQLite database storing historical usage and approval audit logs.
-
-### Adjusting Quotas:
-In `~/.config/linux-data-guardian/config.yaml`:
 ```yaml
 quotas:
-  daily_limit_mb: 1000     # Daily mobile data cap (MB)
-  monthly_limit_mb: 25000  # Monthly mobile data cap (MB)
-  warning_threshold_percent: 80
-  action_on_exhaustion: "block_unapproved"
+  daily_limit_mb: 1000        # metered only; 0 = unlimited
+  monthly_limit_mb: 25000     # metered only; 0 = unlimited
+  billing_cycle_day: 1        # 1-28
+  warning_thresholds: [80, 95]
+  action_on_exhaustion: "block_unapproved"   # or "warn_only"
+  max_allowance_mb: 10000
+```
+
+Changing the daily limit updates the stored limit on the next evaluation.
+Allowances never survive into the next day.
+
+---
+
+## Safety and recovery
+
+* All rules live in `table inet data_guardian`; `ufw` and other tables are not
+  modified.
+* Every apply starts with `destroy table` in the same transaction, so retries
+  and crashes cannot duplicate rules.
+* If the daemon dies, `ExecStopPost` flushes the table. A live daemon keeps its
+  socket; `data-guardian bypass` asks it to flush rather than deleting the
+  socket.
+* `./scripts/emergency-disable.sh` works even if Python is broken: it tries the
+  daemon, then the helper directly.
+
+Uninstall:
+
+```bash
+./scripts/uninstall.sh            # remove app + system integration, keep data
+./scripts/uninstall.sh --purge    # also delete config and usage history
+sudo ./scripts/uninstall.sh --purge   # when started through sudo
 ```
 
 ---
 
-## 🛡️ Safety & Fail-Safe Architecture
+## Development
 
-1. **Isolated Firewall:** All filtering is contained within `table inet data_guardian` in `nftables`. It will never modify or break your system `ufw` configuration.
-2. **Fail-Open Recovery:** If you ever need immediate open networking, running `./scripts/emergency-disable.sh` flushes Data Guardian rules atomically in 5 milliseconds.
-3. **Low Resource Footprint:** Designed specifically for 4GB RAM laptops: uses **< 35 MB of RAM** and **< 0.2% CPU** when idle.
+```bash
+python3 -m pytest -q        # 124 hermetic tests, no root required
+ruff check src tests        # optional; CI runs it
+```
+
+The test suite covers quota arithmetic, schema v2 → v3 migration, ruleset
+rendering plus real `nft -c` parsing, helper argument validation, IPC
+concurrency, configuration hardening, installer safety, and daemon command
+handlers. See `ImprovePlan.md` for the audit that produced the current design.
+
+Pull requests run the same suite on Python 3.10 and 3.12 via GitHub Actions.

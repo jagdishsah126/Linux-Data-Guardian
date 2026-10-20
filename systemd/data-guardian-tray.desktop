@@ -1,10 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Linux Data Guardian
-Comment=Mobile SIM Data Saver and Usage Monitor for XFCE
-Exec=/home/jagdish/.local/bin/data-guardian tray
+Comment=Mobile data saver and usage monitor
+Exec=@HOME@/.local/bin/data-guardian tray
 Icon=linux-data-guardian
 Terminal=false
 Categories=Network;Monitor;Utility;
 StartupNotify=false
 X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=10

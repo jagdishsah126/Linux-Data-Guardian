@@ -1,22 +1,25 @@
 [Unit]
 Description=Linux Data Guardian Daemon
+Documentation=https://github.com/jagdishsah126/Linux-Data-Guardian
 After=network.target network-online.target NetworkManager.service
 Wants=network-online.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
-User=jagdish
-Group=jagdish
-WorkingDirectory=/home/jagdish/Desktop/System Files/Linux Data Guardian
-Environment="PYTHONPATH=/home/jagdish/Desktop/System Files/Linux Data Guardian"
-Environment="HOME=/home/jagdish"
-Environment="XDG_CONFIG_HOME=/home/jagdish/.config"
-Environment="XDG_DATA_HOME=/home/jagdish/.local/share"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
+User=@USER@
+Group=@USER@
+WorkingDirectory=@PROJECT_DIR@
+Environment="PYTHONPATH=@PROJECT_DIR@"
+Environment="HOME=@HOME@"
+Environment="XDG_CONFIG_HOME=@HOME@/.config"
+Environment="XDG_DATA_HOME=@HOME@/.local/share"
+Environment="XDG_RUNTIME_DIR=/run/user/%U"
 ExecStart=/usr/bin/python3 -m src.data_guardian.main daemon
+ExecStopPost=-/usr/local/libexec/data-guardian-helper --flush
 Restart=on-failure
 RestartSec=5
-# No ProtectSystem/ProtectHome — user service reads from ~/.config
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target

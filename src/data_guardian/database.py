@@ -1,36 +1,82 @@
-"""SQLite database storage and queries for Linux Data Guardian."""
+"""SQLite database storage and queries for Linux Data Guardian.
+
+Schema v3 separates three concerns that were previously conflated:
+
+* ``daily_usage``        — combined statistics (all interfaces), chart data only.
+* ``network_daily_usage``— per-network statistics; the ``metered`` flag is frozen
+                           at write time so that changing the designated hotspot
+                           never re-labels historical bytes.
+* ``quota_state``        — the authoritative quota bookkeeping for a day
+                           (limit, temporary allowance, fired warnings, exceeded).
+
+Quota decisions must never be derived from statistics tables.
+"""
 
 from __future__ import annotations
+
+import os
 import sqlite3
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class Database:
-    """Manages SQLite connection, schema migrations, and persistent usage records."""
+    """Manages the SQLite connection, schema migrations, and persistent records."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, designated_uuid: str = "") -> None:
         self.db_path = Path(db_path)
+        self.designated_uuid = designated_uuid or ""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._migrate()
+        self._harden_permissions()
+
+    # --- connection / permissions -------------------------------------------
+
+    def _harden_permissions(self) -> None:
+        """Usage history is private: data dir 0700, database files 0600."""
+        try:
+            os.chmod(self.db_path.parent, 0o700)
+        except OSError:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.db_path}{suffix}")
+            if candidate.exists():
+                try:
+                    os.chmod(candidate, 0o600)
+                except OSError:
+                    pass
+        # The WAL/SHM files are created lazily by SQLite; force a connection so
+        # they exist now and can be tightened.
+        try:
+            with self._get_connection() as conn:
+                conn.execute("PRAGMA user_version;")
+            for suffix in ("", "-wal", "-shm"):
+                candidate = Path(f"{self.db_path}{suffix}")
+                if candidate.exists():
+                    os.chmod(candidate, 0o600)
+        except OSError:
+            pass
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA wal_autocheckpoint = 256;")
+        conn.execute("PRAGMA foreign_keys = ON;")
         return conn
+
+    # --- schema --------------------------------------------------------------
 
     def _init_db(self) -> None:
         """Create tables and indexes if they do not exist."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # Schema versioning
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY,
@@ -38,7 +84,6 @@ class Database:
                 );
             """)
 
-            # Network connection sessions
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,27 +92,23 @@ class Database:
                     interface_name TEXT,
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
+                    last_update TEXT,
                     rx_bytes INTEGER DEFAULT 0,
                     tx_bytes INTEGER DEFAULT 0,
                     profile TEXT DEFAULT 'balanced'
                 );
             """)
 
-            # Daily aggregated network usage (combined all networks, legacy)
+            # Statistics only — never used for quota decisions.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS daily_usage (
                     date TEXT PRIMARY KEY,
                     rx_bytes INTEGER DEFAULT 0,
                     tx_bytes INTEGER DEFAULT 0,
-                    quota_limit_bytes INTEGER DEFAULT 0,
-                    warning_fired INTEGER DEFAULT 0,
-                    quota_exceeded INTEGER DEFAULT 0,
-                    temporary_allowance_bytes INTEGER DEFAULT 0,
                     updated_at TEXT
                 );
             """)
 
-            # Per-network daily usage (v2: keyed by date + connection_uuid)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS network_daily_usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,20 +117,35 @@ class Database:
                     connection_name TEXT NOT NULL,
                     rx_bytes INTEGER DEFAULT 0,
                     tx_bytes INTEGER DEFAULT 0,
+                    metered INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT,
                     UNIQUE(date, connection_uuid)
                 );
             """)
+
+            # Authoritative quota bookkeeping.
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_net_usage_date
-                ON network_daily_usage(date);
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_net_usage_uuid
-                ON network_daily_usage(connection_uuid);
+                CREATE TABLE IF NOT EXISTS quota_state (
+                    date TEXT PRIMARY KEY,
+                    daily_limit_bytes INTEGER NOT NULL DEFAULT 0,
+                    allowance_bytes INTEGER NOT NULL DEFAULT 0,
+                    warnings_fired TEXT NOT NULL DEFAULT '',
+                    exceeded INTEGER NOT NULL DEFAULT 0,
+                    blocked_reason TEXT,
+                    updated_at TEXT NOT NULL
+                );
             """)
 
-            # Package and dependency approval requests & audit log
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    urgency TEXT NOT NULL DEFAULT 'normal'
+                );
+            """)
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS approval_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,19 +158,24 @@ class Database:
                 );
             """)
 
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_net_usage_date ON network_daily_usage(date);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_net_usage_uuid ON network_daily_usage(connection_uuid);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_uuid ON sessions(connection_uuid);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_time ON sessions(started_at);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_approval_time ON approval_events(timestamp);")
 
-            # Check and record version
             cursor.execute("SELECT MAX(version) FROM schema_version;")
             row = cursor.fetchone()
             if not row or row[0] is None:
                 cursor.execute(
                     "INSERT INTO schema_version (version, applied_at) VALUES (?, datetime('now'));",
-                    (1,)
+                    (1,),
                 )
             conn.commit()
+
+    def _columns(self, cursor: sqlite3.Cursor, table: str) -> set:
+        cursor.execute(f"PRAGMA table_info({table});")
+        return {r["name"] for r in cursor.fetchall()}
 
     def _migrate(self) -> None:
         """Apply schema migrations for version upgrades."""
@@ -122,24 +183,18 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT MAX(version) FROM schema_version;")
             row = cursor.fetchone()
-            current_version = row[0] if row and row[0] is not None else 1
+            current = row[0] if row and row[0] is not None else 1
 
-            if current_version < 2:
-                # v2: Migrate today's combined daily_usage into network_daily_usage
-                # for ALHN-449C (the only network used so far, detected from sessions)
+            if current < 2:
                 cursor.execute("""
                     SELECT connection_uuid, connection_name,
-                           SUM(rx_bytes) as rx, SUM(tx_bytes) as tx
+                           SUM(rx_bytes) AS rx, SUM(tx_bytes) AS tx
                     FROM sessions
                     WHERE date(started_at) = date('now')
                     GROUP BY connection_uuid, connection_name;
                 """)
                 session_rows = cursor.fetchall()
-
-                cursor.execute("SELECT * FROM daily_usage WHERE date = date('now');")
-                today_row = cursor.fetchone()
-
-                if today_row and session_rows:
+                if session_rows:
                     for sr in session_rows:
                         if not sr["connection_uuid"]:
                             continue
@@ -151,350 +206,522 @@ class Database:
                                 rx_bytes = excluded.rx_bytes,
                                 tx_bytes = excluded.tx_bytes,
                                 updated_at = excluded.updated_at;
-                        """, (sr["connection_uuid"], sr["connection_name"],
-                              sr["rx"], sr["tx"]))
-
+                        """, (sr["connection_uuid"], sr["connection_name"], sr["rx"], sr["tx"]))
                 cursor.execute(
                     "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (2, datetime('now'));"
                 )
                 conn.commit()
+                current = 2
 
-    # --- Session Management ---
+            if current < 3:
+                # 1. network_daily_usage.metered ---------------------------------
+                if "metered" not in self._columns(cursor, "network_daily_usage"):
+                    cursor.execute("ALTER TABLE network_daily_usage ADD COLUMN metered INTEGER NOT NULL DEFAULT 0;")
+                if self.designated_uuid:
+                    cursor.execute(
+                        "UPDATE network_daily_usage SET metered = 1 WHERE connection_uuid = ?;",
+                        (self.designated_uuid,),
+                    )
+
+                # 2. sessions.last_update ---------------------------------------
+                if "last_update" not in self._columns(cursor, "sessions"):
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN last_update TEXT;")
+                    cursor.execute("UPDATE sessions SET last_update = COALESCE(ended_at, started_at);")
+
+                # 3. quota_state seeding from the legacy daily_usage columns ----
+                legacy_cols = self._columns(cursor, "daily_usage")
+                if "quota_limit_bytes" in legacy_cols:
+                    cursor.execute("""
+                        SELECT date, quota_limit_bytes, temporary_allowance_bytes,
+                               warning_fired, quota_exceeded
+                        FROM daily_usage
+                        WHERE quota_limit_bytes > 0 OR temporary_allowance_bytes > 0;
+                    """)
+                    for r in cursor.fetchall():
+                        cursor.execute("""
+                            INSERT INTO quota_state
+                                (date, daily_limit_bytes, allowance_bytes, warnings_fired,
+                                 exceeded, blocked_reason, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                            ON CONFLICT(date) DO UPDATE SET
+                                daily_limit_bytes = MAX(daily_limit_bytes, excluded.daily_limit_bytes),
+                                allowance_bytes = MAX(allowance_bytes, excluded.allowance_bytes),
+                                warnings_fired = excluded.warnings_fired,
+                                exceeded = MAX(exceeded, excluded.exceeded);
+                        """, (
+                            r["date"], r["quota_limit_bytes"], r["temporary_allowance_bytes"],
+                            "80" if r["warning_fired"] else "",
+                            r["quota_exceeded"], "legacy" if r["quota_exceeded"] else None,
+                        ))
+
+                cursor.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (3, datetime('now'));"
+                )
+                conn.commit()
+                current = 3
+
+            if current < CURRENT_SCHEMA_VERSION:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, datetime('now'));",
+                    (CURRENT_SCHEMA_VERSION,),
+                )
+                conn.commit()
+
+            # Indexes that depend on migrated columns are created here, after the
+            # ALTER TABLE statements above (they would fail on an old schema).
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_net_usage_metered "
+                "ON network_daily_usage(metered, date);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_time ON sessions(started_at);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_time ON approval_events(timestamp);"
+            )
+            conn.commit()
+
+    # --- session management ---------------------------------------------------
 
     def start_session(
         self,
         connection_uuid: str,
         connection_name: str,
         interface_name: str,
-        profile: str = "balanced"
+        profile: str = "balanced",
     ) -> int:
-        """Records a new network session and returns its session ID."""
         now = datetime.now().isoformat()
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO sessions (connection_uuid, connection_name, interface_name, started_at, profile)
-                VALUES (?, ?, ?, ?, ?);
-            """, (connection_uuid, connection_name, interface_name, now, profile))
+                INSERT INTO sessions
+                    (connection_uuid, connection_name, interface_name, started_at, last_update, profile)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (connection_uuid, connection_name, interface_name, now, now, profile))
             conn.commit()
             return cursor.lastrowid or 0
 
     def update_session(self, session_id: int, delta_rx: int, delta_tx: int) -> None:
-        """Increment rx and tx bytes on an active session."""
         with self._get_connection() as conn:
             conn.execute("""
                 UPDATE sessions
                 SET rx_bytes = rx_bytes + ?,
-                    tx_bytes = tx_bytes + ?
+                    tx_bytes = tx_bytes + ?,
+                    last_update = ?
                 WHERE id = ?;
-            """, (delta_rx, delta_tx, session_id))
+            """, (delta_rx, delta_tx, datetime.now().isoformat(), session_id))
             conn.commit()
 
     def end_session(self, session_id: int) -> None:
-        """Mark a session as ended."""
         now = datetime.now().isoformat()
         with self._get_connection() as conn:
-            conn.execute("UPDATE sessions SET ended_at = ? WHERE id = ?;", (now, session_id))
+            conn.execute(
+                "UPDATE sessions SET ended_at = ?, last_update = ? WHERE id = ?;",
+                (now, now, session_id),
+            )
             conn.commit()
 
-    # --- Daily Usage & Quotas ---
+    def close_orphan_sessions(self) -> int:
+        """Close sessions left open by an unclean shutdown. Returns rows affected."""
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cur = conn.execute("""
+                UPDATE sessions
+                SET ended_at = COALESCE(last_update, started_at)
+                WHERE ended_at IS NULL;
+            """)
+            conn.commit()
+            return cur.rowcount or 0
+
+    # --- statistics -----------------------------------------------------------
 
     def record_usage_delta(
         self,
         delta_rx: int,
         delta_tx: int,
-        quota_limit_bytes: int = 0,
+        *,
+        metered: bool = False,
+        daily_limit_bytes: int = 0,
         target_date: Optional[str] = None,
         connection_uuid: str = "",
-        connection_name: str = ""
+        connection_name: str = "",
     ) -> Dict[str, Any]:
-        """Add delta usage to the specified date (default today) and check quota status."""
-        today_str = target_date or date.today().isoformat()
+        """Record a traffic delta as statistics and update quota bookkeeping.
+
+        ``metered`` is stamped onto the per-network row at write time.
+        ``daily_limit_bytes`` is only used to refresh the stored limit; it never
+        makes an unlimited plan look exhausted.
+        """
+        day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # Upsert combined daily row (legacy + still used for quota tracking)
             cursor.execute("""
-                INSERT INTO daily_usage (date, rx_bytes, tx_bytes, quota_limit_bytes, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO daily_usage (date, rx_bytes, tx_bytes, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(date) DO UPDATE SET
                     rx_bytes = rx_bytes + excluded.rx_bytes,
                     tx_bytes = tx_bytes + excluded.tx_bytes,
-                    quota_limit_bytes = CASE WHEN excluded.quota_limit_bytes > 0 THEN excluded.quota_limit_bytes ELSE daily_usage.quota_limit_bytes END,
                     updated_at = excluded.updated_at;
-            """, (today_str, delta_rx, delta_tx, quota_limit_bytes, now))
+            """, (day, delta_rx, delta_tx, now))
 
-            # Upsert per-network daily row
             if connection_uuid and connection_name:
                 cursor.execute("""
                     INSERT INTO network_daily_usage
-                        (date, connection_uuid, connection_name, rx_bytes, tx_bytes, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (date, connection_uuid, connection_name, rx_bytes, tx_bytes, metered, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(date, connection_uuid) DO UPDATE SET
                         rx_bytes = rx_bytes + excluded.rx_bytes,
                         tx_bytes = tx_bytes + excluded.tx_bytes,
                         connection_name = excluded.connection_name,
+                        metered = MAX(network_daily_usage.metered, excluded.metered),
                         updated_at = excluded.updated_at;
-                """, (today_str, connection_uuid, connection_name, delta_rx, delta_tx, now))
+                """, (day, connection_uuid, connection_name, delta_rx, delta_tx,
+                      1 if metered else 0, now))
 
-            # Fetch updated combined row
-            cursor.execute("SELECT * FROM daily_usage WHERE date = ?;", (today_str,))
-            row = cursor.fetchone()
+            self._ensure_quota_row(cursor, day, now)
+            if daily_limit_bytes > 0:
+                cursor.execute(
+                    "UPDATE quota_state SET daily_limit_bytes = ?, updated_at = ? WHERE date = ?;",
+                    (daily_limit_bytes, now, day),
+                )
             conn.commit()
 
-            if not row:
-                return {}
-
-            total_bytes = row["rx_bytes"] + row["tx_bytes"]
-            effective_limit = row["quota_limit_bytes"] + row["temporary_allowance_bytes"]
-            exceeded = (effective_limit > 0) and (total_bytes >= effective_limit)
-
-            if exceeded and not row["quota_exceeded"]:
-                with self._get_connection() as conn2:
-                    conn2.execute("UPDATE daily_usage SET quota_exceeded = 1 WHERE date = ?;", (today_str,))
-                    conn2.commit()
-
-            return {
-                "date": row["date"],
-                "rx_bytes": row["rx_bytes"],
-                "tx_bytes": row["tx_bytes"],
-                "total_bytes": total_bytes,
-                "quota_limit_bytes": row["quota_limit_bytes"],
-                "temporary_allowance_bytes": row["temporary_allowance_bytes"],
-                "effective_limit_bytes": effective_limit,
-                "quota_exceeded": bool(exceeded),
-                "warning_fired": bool(row["warning_fired"]),
-            }
+        return self.get_today_usage(day)
 
     def get_today_usage(self, target_date: Optional[str] = None) -> Dict[str, Any]:
-        """Fetch usage for today or specified date (combined all networks)."""
-        today_str = target_date or date.today().isoformat()
+        """Combined statistics for the day plus authoritative quota bookkeeping."""
+        day = target_date or date.today().isoformat()
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM daily_usage WHERE date = ?;", (today_str,))
-            row = cursor.fetchone()
-            if not row:
-                return {
-                    "date": today_str,
-                    "rx_bytes": 0,
-                    "tx_bytes": 0,
-                    "total_bytes": 0,
-                    "quota_limit_bytes": 0,
-                    "temporary_allowance_bytes": 0,
-                    "effective_limit_bytes": 0,
-                    "quota_exceeded": False,
-                    "warning_fired": False,
-                }
-            total = row["rx_bytes"] + row["tx_bytes"]
-            effective_limit = row["quota_limit_bytes"] + row["temporary_allowance_bytes"]
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM daily_usage WHERE date = ?;", (day,))
+            row = cur.fetchone()
+            rx = row["rx_bytes"] if row else 0
+            tx = row["tx_bytes"] if row else 0
+
+            cur.execute("SELECT * FROM quota_state WHERE date = ?;", (day,))
+            q = cur.fetchone()
+
+            limit = q["daily_limit_bytes"] if q else 0
+            allowance = q["allowance_bytes"] if q else 0
+            effective = (limit + allowance) if limit > 0 else 0
+            warnings = (q["warnings_fired"].split(",") if q and q["warnings_fired"] else [])
+            exceeded = bool(q["exceeded"]) if q else False
+
             return {
-                "date": row["date"],
-                "rx_bytes": row["rx_bytes"],
-                "tx_bytes": row["tx_bytes"],
-                "total_bytes": total,
-                "quota_limit_bytes": row["quota_limit_bytes"],
-                "temporary_allowance_bytes": row["temporary_allowance_bytes"],
-                "effective_limit_bytes": effective_limit,
-                "quota_exceeded": bool(row["quota_exceeded"]),
-                "warning_fired": bool(row["warning_fired"]),
+                "date": day,
+                "rx_bytes": rx,
+                "tx_bytes": tx,
+                "total_bytes": rx + tx,
+                "quota_limit_bytes": limit,
+                "temporary_allowance_bytes": allowance,
+                "effective_limit_bytes": effective,
+                "quota_exceeded": exceeded,
+                "warning_fired": bool(warnings),
+                "warnings_fired": [int(w) for w in warnings if w],
+                "blocked_reason": q["blocked_reason"] if q else None,
             }
 
     def get_network_today_usage(
         self, connection_uuid: str, target_date: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Fetch today's usage for a specific network UUID."""
-        today_str = target_date or date.today().isoformat()
+        day = target_date or date.today().isoformat()
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+            cur = conn.cursor()
+            cur.execute(
                 "SELECT * FROM network_daily_usage WHERE date = ? AND connection_uuid = ?;",
-                (today_str, connection_uuid)
+                (day, connection_uuid),
             )
-            row = cursor.fetchone()
+            row = cur.fetchone()
             if not row:
-                return {"date": today_str, "rx_bytes": 0, "tx_bytes": 0, "total_bytes": 0}
-            total = row["rx_bytes"] + row["tx_bytes"]
+                return {"date": day, "connection_uuid": connection_uuid,
+                        "rx_bytes": 0, "tx_bytes": 0, "total_bytes": 0, "metered": False}
             return {
                 "date": row["date"],
                 "connection_uuid": row["connection_uuid"],
                 "connection_name": row["connection_name"],
                 "rx_bytes": row["rx_bytes"],
                 "tx_bytes": row["tx_bytes"],
-                "total_bytes": total,
+                "total_bytes": row["rx_bytes"] + row["tx_bytes"],
+                "metered": bool(row["metered"]),
             }
+
+    # --- quota bookkeeping -----------------------------------------------------
+
+    def _ensure_quota_row(self, cursor: sqlite3.Cursor, day: str, now: str) -> None:
+        cursor.execute(
+            "INSERT OR IGNORE INTO quota_state (date, updated_at) VALUES (?, ?);",
+            (day, now),
+        )
+
+    def get_quota_state(self, target_date: Optional[str] = None) -> Dict[str, Any]:
+        day = target_date or date.today().isoformat()
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self._ensure_quota_row(cursor, day, now)
+            conn.commit()
+            cursor.execute("SELECT * FROM quota_state WHERE date = ?;", (day,))
+            row = cursor.fetchone()
+            return dict(row) if row else {}
+
+    def grant_temporary_allowance(
+        self, allowance_bytes: int, target_date: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Grant extra bytes for the day. Works even before any traffic is recorded."""
+        if allowance_bytes <= 0:
+            raise ValueError("allowance_bytes must be positive")
+        day = target_date or date.today().isoformat()
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self._ensure_quota_row(cursor, day, now)
+            cursor.execute("""
+                UPDATE quota_state
+                SET allowance_bytes = allowance_bytes + ?,
+                    exceeded = 0,
+                    blocked_reason = NULL,
+                    updated_at = ?
+                WHERE date = ?;
+            """, (allowance_bytes, now, day))
+            conn.commit()
+        return self.get_quota_state(day)
+
+    def mark_warning_fired(self, level: int, target_date: Optional[str] = None) -> bool:
+        """Record that a warning threshold fired. Returns True if newly recorded."""
+        day = target_date or date.today().isoformat()
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self._ensure_quota_row(cursor, day, now)
+            cursor.execute("SELECT warnings_fired FROM quota_state WHERE date = ?;", (day,))
+            row = cursor.fetchone()
+            levels = [x for x in (row["warnings_fired"].split(",") if row and row["warnings_fired"] else []) if x]
+            if str(level) in levels:
+                return False
+            levels.append(str(level))
+            cursor.execute(
+                "UPDATE quota_state SET warnings_fired = ?, updated_at = ? WHERE date = ?;",
+                (",".join(levels), now, day),
+            )
+            conn.commit()
+            return True
+
+    def set_quota_exceeded(
+        self, exceeded: bool, reason: Optional[str] = None, target_date: Optional[str] = None
+    ) -> None:
+        day = target_date or date.today().isoformat()
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self._ensure_quota_row(cursor, day, now)
+            cursor.execute(
+                "UPDATE quota_state SET exceeded = ?, blocked_reason = ?, updated_at = ? WHERE date = ?;",
+                (1 if exceeded else 0, reason, now, day),
+            )
+            conn.commit()
+
+    def set_daily_limit(self, limit_bytes: int, target_date: Optional[str] = None) -> None:
+        """Store the configured daily limit for the day (0 means unlimited)."""
+        day = target_date or date.today().isoformat()
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self._ensure_quota_row(cursor, day, now)
+            cursor.execute(
+                "UPDATE quota_state SET daily_limit_bytes = ?, updated_at = ? WHERE date = ?;",
+                (max(0, int(limit_bytes)), now, day),
+            )
+            conn.commit()
+
+
+    # --- metered totals (quota basis) ------------------------------------------
+
+    def metered_total(self, target_date: Optional[str] = None) -> int:
+        day = target_date or date.today().isoformat()
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total
+                FROM network_daily_usage
+                WHERE date = ? AND metered = 1;
+            """, (day,))
+            row = cur.fetchone()
+            return int(row["total"]) if row else 0
+
+    def metered_total_cycle(self, billing_cycle_day: int = 1,
+                            target_date: Optional[str] = None) -> int:
+        today = date.fromisoformat(target_date) if target_date else date.today()
+        cycle_day = max(1, min(int(billing_cycle_day), 28))
+        if today.day >= cycle_day:
+            start = today.replace(day=cycle_day)
+        else:
+            start = (today.replace(day=1) - timedelta(days=1)).replace(day=cycle_day)
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total
+                FROM network_daily_usage
+                WHERE metered = 1 AND date >= ? AND date <= ?;
+            """, (start.isoformat(), today.isoformat()))
+            row = cur.fetchone()
+            return int(row["total"]) if row else 0
 
     def get_monthly_usage(
         self, connection_uuid: Optional[str] = None, billing_cycle_day: int = 1
     ) -> Dict[str, Any]:
-        """Calculates total usage for the current billing cycle month.
-        If connection_uuid is given, calculates strictly for that network;
-        otherwise aggregates all networks.
-        """
+        """Metered usage for the current billing cycle (used for the monthly quota)."""
         today = date.today()
-        # Compute start date based on billing cycle day
         cycle_day = max(1, min(int(billing_cycle_day), 28))
         if today.day >= cycle_day:
-            start_date = today.replace(day=cycle_day)
+            start = today.replace(day=cycle_day)
         else:
-            prev_month_last = today.replace(day=1) - timedelta(days=1)
-            start_date = prev_month_last.replace(day=cycle_day)
+            start = (today.replace(day=1) - timedelta(days=1)).replace(day=cycle_day)
+        start_str, end_str = start.isoformat(), today.isoformat()
 
-        start_str = start_date.isoformat()
-        end_str = today.isoformat()
+        sql = """
+            SELECT COALESCE(SUM(rx_bytes), 0) AS total_rx,
+                   COALESCE(SUM(tx_bytes), 0) AS total_tx,
+                   COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+            FROM network_daily_usage
+            WHERE metered = 1 AND date >= ? AND date <= ?
+        """
+        params: List[Any] = [start_str, end_str]
+        if connection_uuid:
+            sql += " AND connection_uuid = ?"
+            params.append(connection_uuid)
 
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            if connection_uuid:
-                cursor.execute("""
-                    SELECT COALESCE(SUM(rx_bytes), 0) AS total_rx,
-                           COALESCE(SUM(tx_bytes), 0) AS total_tx,
-                           COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
-                    FROM network_daily_usage
-                    WHERE connection_uuid = ?
-                      AND date >= ? AND date <= ?;
-                """, (connection_uuid, start_str, end_str))
-                row = cursor.fetchone()
-                return {
-                    "start_date": start_str,
-                    "end_date": end_str,
-                    "connection_uuid": connection_uuid,
-                    "rx_bytes": row["total_rx"] if row else 0,
-                    "tx_bytes": row["total_tx"] if row else 0,
-                    "total_bytes": row["total_bytes"] if row else 0,
-                }
-            else:
-                cursor.execute("""
-                    SELECT COALESCE(SUM(rx_bytes), 0) AS total_rx,
-                           COALESCE(SUM(tx_bytes), 0) AS total_tx,
-                           COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
-                    FROM daily_usage
-                    WHERE date >= ? AND date <= ?;
-                """, (start_str, end_str))
-                row = cursor.fetchone()
-                return {
-                    "start_date": start_str,
-                    "end_date": end_str,
-                    "connection_uuid": None,
-                    "rx_bytes": row["total_rx"] if row else 0,
-                    "tx_bytes": row["total_tx"] if row else 0,
-                    "total_bytes": row["total_bytes"] if row else 0,
-                }
+            cur = conn.cursor()
+            cur.execute(sql + ";", params)
+            row = cur.fetchone()
+            return {
+                "start_date": start_str,
+                "end_date": end_str,
+                "connection_uuid": connection_uuid,
+                "rx_bytes": int(row["total_rx"]) if row else 0,
+                "tx_bytes": int(row["total_tx"]) if row else 0,
+                "total_bytes": int(row["total_bytes"]) if row else 0,
+            }
 
-    def get_network_history(
-        self, connection_uuid: str, days: int = 60
-    ) -> List[Dict[str, Any]]:
-        """Fetch per-network usage for the last N days, one row per day."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT date, connection_name,
-                       rx_bytes, tx_bytes, (rx_bytes + tx_bytes) AS total_bytes
-                FROM network_daily_usage
-                WHERE connection_uuid = ?
-                  AND date >= date('now', ? || ' days')
-                ORDER BY date ASC;
-            """, (connection_uuid, f"-{days}"))
-            return [dict(r) for r in cursor.fetchall()]
+    # --- history / chart data --------------------------------------------------
 
     def get_all_networks_history(self, days: int = 60) -> Dict[str, List[Dict[str, Any]]]:
-        """Fetch per-network usage history for all known networks for the last N days.
-        Returns dict keyed by connection_uuid → list of {date, rx_bytes, tx_bytes, total_bytes}.
-        Also returns a special key '__all__' for combined totals per day.
-        """
+        """Per-network daily history for the last ``days`` days (inclusive of today)."""
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
+            cur = conn.cursor()
+            cur.execute("""
                 SELECT date, connection_uuid, connection_name,
-                       rx_bytes, tx_bytes, (rx_bytes + tx_bytes) AS total_bytes
+                       rx_bytes, tx_bytes, (rx_bytes + tx_bytes) AS total_bytes, metered
                 FROM network_daily_usage
-                WHERE date >= date('now', ? || ' days')
+                WHERE date > date('now', ? || ' days')
                 ORDER BY date ASC;
             """, (f"-{days}",))
-            rows = [dict(r) for r in cursor.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
 
         result: Dict[str, List[Dict[str, Any]]] = {}
         combined: Dict[str, Dict[str, Any]] = {}
-
         for r in rows:
-            uuid = r["connection_uuid"]
-            if uuid not in result:
-                result[uuid] = []
-            result[uuid].append(r)
-
+            result.setdefault(r["connection_uuid"], []).append(r)
             d = r["date"]
-            if d not in combined:
-                combined[d] = {"date": d, "rx_bytes": 0, "tx_bytes": 0, "total_bytes": 0}
+            combined.setdefault(d, {"date": d, "rx_bytes": 0, "tx_bytes": 0, "total_bytes": 0})
             combined[d]["rx_bytes"] += r["rx_bytes"]
             combined[d]["tx_bytes"] += r["tx_bytes"]
             combined[d]["total_bytes"] += r["total_bytes"]
-
         result["__all__"] = sorted(combined.values(), key=lambda x: x["date"])
         return result
 
     def get_known_networks(self) -> List[Dict[str, Any]]:
-        """Return list of all networks we have ever tracked data for."""
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT connection_uuid,
-                       connection_name,
-                       SUM(rx_bytes) as total_rx,
-                       SUM(tx_bytes) as total_tx,
-                       MAX(date) as last_seen
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT connection_uuid, connection_name,
+                       SUM(rx_bytes) AS total_rx, SUM(tx_bytes) AS total_tx,
+                       MAX(date) AS last_seen, MAX(metered) AS metered
                 FROM network_daily_usage
                 GROUP BY connection_uuid
                 ORDER BY last_seen DESC;
             """)
-            return [dict(r) for r in cursor.fetchall()]
+            return [dict(r) for r in cur.fetchall()]
 
-    def grant_temporary_allowance(self, allowance_bytes: int, target_date: Optional[str] = None) -> None:
-        """Grant temporary extra megabytes for today's quota."""
-        today_str = target_date or date.today().isoformat()
+    # --- notifications ---------------------------------------------------------
+
+    def add_notification(self, title: str, message: str, urgency: str = "normal") -> int:
         with self._get_connection() as conn:
-            conn.execute("""
-                UPDATE daily_usage
-                SET temporary_allowance_bytes = temporary_allowance_bytes + ?,
-                    quota_exceeded = 0
-                WHERE date = ?;
-            """, (allowance_bytes, today_str))
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO notifications (ts, title, message, urgency) VALUES (?, ?, ?, ?);",
+                (datetime.now().isoformat(), title, message, urgency),
+            )
             conn.commit()
+            return cur.lastrowid or 0
 
-    def set_warning_fired(self, target_date: Optional[str] = None) -> None:
-        """Mark warning notification as sent for today to prevent repeated alerts."""
-        today_str = target_date or date.today().isoformat()
+    def latest_notification_id(self) -> int:
         with self._get_connection() as conn:
-            conn.execute("UPDATE daily_usage SET warning_fired = 1 WHERE date = ?;", (today_str,))
-            conn.commit()
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(id), 0) AS m FROM notifications;")
+            row = cur.fetchone()
+            return int(row["m"]) if row else 0
 
-    # --- Approval Events Audit Log ---
+    def get_notifications_since(self, since_id: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM notifications WHERE id > ? ORDER BY id ASC LIMIT ?;",
+                (since_id, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def prune_notifications(self, keep_hours: int = 24) -> int:
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM notifications WHERE ts < datetime('now', ?);",
+                (f"-{keep_hours} hours",),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
+    # --- maintenance -----------------------------------------------------------
+
+    def prune_history(self, retention_days: int = 90) -> int:
+        """Drop statistics older than the retention window."""
+        if retention_days <= 0:
+            return 0
+        cutoff = (date.today() - timedelta(days=retention_days)).isoformat()
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM network_daily_usage WHERE date < ?;", (cutoff,))
+            removed = cur.rowcount or 0
+            cur.execute("DELETE FROM daily_usage WHERE date < ?;", (cutoff,))
+            cur.execute("DELETE FROM quota_state WHERE date < ?;", (cutoff,))
+            cur.execute("DELETE FROM sessions WHERE ended_at IS NOT NULL AND date(started_at) < ?;", (cutoff,))
+            conn.commit()
+            return removed
+
+    def checkpoint(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+    # --- approval events -------------------------------------------------------
 
     def record_approval_event(
-        self,
-        tool: str,
-        packages: str,
-        estimated_bytes: int,
-        decision: str
+        self, tool: str, packages: str, estimated_bytes: int, decision: str
     ) -> int:
-        """Logs an approval or denial event."""
         now = datetime.now().isoformat()
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
+            cur = conn.cursor()
+            cur.execute("""
                 INSERT INTO approval_events (timestamp, tool, packages, estimated_bytes, decision, resolved_at)
                 VALUES (?, ?, ?, ?, ?, ?);
             """, (now, tool, packages, estimated_bytes, decision, now))
             conn.commit()
-            return cursor.lastrowid or 0
+            return cur.lastrowid or 0
 
     def get_recent_approvals(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Retrieve recent approval and denial events."""
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM approval_events
-                ORDER BY id DESC
-                LIMIT ?;
-            """, (limit,))
-            return [dict(row) for row in cursor.fetchall()]
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM approval_events ORDER BY id DESC LIMIT ?;", (limit,))
+            return [dict(row) for row in cur.fetchall()]

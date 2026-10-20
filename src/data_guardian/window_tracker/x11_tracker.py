@@ -32,6 +32,59 @@ class X11WindowTracker:
             return False
         return Path("/usr/bin/xprop").exists()
 
+    @staticmethod
+    def autodetect_environment() -> bool:
+        """Best-effort discovery of DISPLAY/XAUTHORITY for a systemd service.
+
+        A system service inherits no session environment, so ``xprop`` fails and
+        the foreground app is always ``unknown``. We ask logind instead.
+        """
+        if os.environ.get("DISPLAY"):
+            return True
+
+        try:
+            import pwd
+
+            uid = os.getuid()
+            username = pwd.getpwuid(uid).pw_name
+            home = pwd.getpwuid(uid).pw_dir
+        except Exception:  # noqa: BLE001
+            return False
+
+        display = ""
+        try:
+            sessions = subprocess.run(
+                ["loginctl", "list-sessions", "--no-legend", "--no-pager"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3,
+            ).stdout
+            for line in sessions.splitlines():
+                fields = line.split()
+                if not fields:
+                    continue
+                session_id = fields[0]
+                prop = subprocess.run(
+                    ["loginctl", "show-session", session_id, "-p", "Name", "-p", "Type", "-p", "Display"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3,
+                ).stdout
+                info = dict(
+                    line.split("=", 1) for line in prop.splitlines() if "=" in line
+                )
+                if info.get("Name") == username and info.get("Type") in ("x11", ""):
+                    display = info.get("Display", "") or display
+                    if display:
+                        break
+        except Exception:  # noqa: BLE001
+            pass
+
+        if not display:
+            return False
+
+        os.environ["DISPLAY"] = display
+        xauthority = Path(home) / ".Xauthority"
+        if xauthority.exists() and not os.environ.get("XAUTHORITY"):
+            os.environ["XAUTHORITY"] = str(xauthority)
+        return True
+
     def get_active_window(self) -> Optional[ActiveWindowInfo]:
         """Queries X11 root window to determine which application has focus."""
         if not self.is_x11_available():

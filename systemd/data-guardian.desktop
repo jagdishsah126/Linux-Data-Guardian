@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Linux Data Guardian
+Comment=Mobile data saver and usage monitor
+Exec=@HOME@/.local/bin/data-guardian dashboard
+Icon=linux-data-guardian
+Terminal=false
+Categories=Network;Monitor;Utility;
+StartupNotify=false

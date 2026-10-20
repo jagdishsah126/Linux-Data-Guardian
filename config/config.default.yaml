@@ -1,42 +1,41 @@
 # Linux Data Guardian — Default Configuration
 app:
   name: "Linux Data Guardian"
-  version: "0.1.0"
+  version: "2.0.0"
   enabled: true
-  # Available profiles: "balanced", "strict", "off"
-  # - balanced: silences background OS updates & telemetry, allows web surfing & coding tools, gates downloads
-  # - strict: foreground-only access (active X11 window) + whitelisted coding tools
-  # - off: monitoring only, no restrictions
+  # Available profiles:
+  #   balanced — blocks background package-manager downloads, everything else allowed
+  #   strict   — only the focused app + allowlisted tools may open new connections
+  #   off      — monitoring only, no firewall rules
   default_profile: "balanced"
   poll_interval_seconds: 5
-  idle_poll_interval_seconds: 15
 
 hotspot:
-  # Connection UUID from NetworkManager (e.g. from `nmcli connection show`)
-  # If empty, Data Guardian prompts or auto-detects on first run
+  # NetworkManager connection UUID. Set with: data-guardian set-hotspot
   designated_uuid: ""
-  designated_name: "NTC Hotspot"
-  auto_activate: true
-  enforce_metered_flag: true
+  designated_name: ""
 
 quotas:
-  # Daily limit in Megabytes (MB). 0 means unlimited.
+  # Daily limit in MB for metered (hotspot) traffic only. 0 = unlimited.
   daily_limit_mb: 1000
-  # Monthly limit in Megabytes (MB). 0 means unlimited.
+  # Monthly limit in MB for metered traffic only. 0 = unlimited.
   monthly_limit_mb: 25000
-  warning_threshold_percent: 80
-  # Action when quota is reached: "block_unapproved" or "warn_only"
+  # Billing cycle start day (1-28).
+  billing_cycle_day: 1
+  # Warn once per threshold per day.
+  warning_thresholds: [80, 95]
+  # "block_unapproved" (enforce) or "warn_only" (never block).
   action_on_exhaustion: "block_unapproved"
-  daily_reset_time: "00:00"
+  # Upper bound for a single manual allowance grant.
+  max_allowance_mb: 10000
 
 approvals:
-  # Enable download prompts before package manager downloads
   apt: true
   pip: true
   npm: true
   cargo: true
   timeout_seconds: 60
-  # If user doesn't respond or closes modal: "deny" or "allow"
+  # "deny" or "allow" when no interactive session is available.
   timeout_action: "deny"
 
 storage:

@@ -2,9 +2,9 @@
 # Linux Data Guardian — Sudoers Configuration
 # Installed to: /etc/sudoers.d/linux-data-guardian
 #
-# Grants user 'jagdish' permission to execute ONLY the dedicated
-# data-guardian-helper script with strictly validated parameters.
-# NO arbitrary nft access or root command execution is permitted.
+# Grants the invoking user permission to run ONLY the dedicated
+# data-guardian-helper script. The helper validates every argument itself, so no
+# wildcard is required here.
 # ==============================================================================
 
-jagdish ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper
+@USER@ ALL=(root) NOPASSWD: /usr/local/libexec/data-guardian-helper

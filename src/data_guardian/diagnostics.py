@@ -1,425 +1,357 @@
-"""System Health and Diagnostic Suite ('data-guardian doctor') for Linux Data Guardian."""
+"""System health and diagnostic suite (``data-guardian doctor``)."""
 
 from __future__ import annotations
-import os
-import sys
-import time
-import socket
+
 import json
+import os
+import shutil
+import socket
 import sqlite3
 import subprocess
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, asdict
+from typing import List, Optional
 
 from src.data_guardian.config import ConfigManager
-from src.data_guardian.database import Database, CURRENT_SCHEMA_VERSION
-from src.data_guardian.firewall.nft_manager import NftablesManager, HELPER_BIN
+from src.data_guardian.database import CURRENT_SCHEMA_VERSION, Database
+from src.data_guardian.firewall.nft_manager import HELPER_BIN, NftablesManager
+from src.data_guardian.ipc import get_socket_path, send_ipc_command
 from src.data_guardian.network.nm_monitor import NetworkMonitor
-from src.data_guardian.ipc import get_socket_path
+
+SUDOERS_FILE = Path("/etc/sudoers.d/linux-data-guardian")
+UNIT_FILE = Path("/etc/systemd/system/data-guardian.service")
+ICON_FILE = Path("/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png")
 
 
 @dataclass
 class CheckResult:
     category: str
     name: str
-    status: str  # "PASS", "WARN", "FAIL"
+    status: str  # PASS | WARN | FAIL
     summary: str
     details: Optional[str] = None
+    fix: Optional[str] = None
 
 
 class Doctor:
-    """Performs deep health and security checks across all system layers."""
+    """Deep health and security checks across every layer."""
 
     def __init__(self, config_mgr: Optional[ConfigManager] = None) -> None:
         self.config_mgr = config_mgr or ConfigManager()
-        self.db = Database(self.config_mgr.db_path)
+        self.db = Database(
+            self.config_mgr.db_path,
+            designated_uuid=self.config_mgr.designated_hotspot_uuid,
+        )
 
     def run_all(self) -> List[CheckResult]:
-        """Runs the complete test suite and returns categorized results."""
-        results: List[CheckResult] = []
-        results.append(self.check_privileged_helper())
-        results.append(self.check_sudoers_rule())
-        results.append(self.check_nftables_isolation())
-        results.append(self.check_daemon_and_ipc())
-        results.append(self.check_database_integrity())
-        results.append(self.check_desktop_integration())
-        results.append(self.check_network_and_hotspot())
-        return results
+        return [
+            self.check_python_dependencies(),
+            self.check_privileged_helper(),
+            self.check_helper_capabilities(),
+            self.check_sudoers_rule(),
+            self.check_nftables(),
+            self.check_strict_cgroups(),
+            self.check_daemon_and_ipc(),
+            self.check_database_integrity(),
+            self.check_file_permissions(),
+            self.check_desktop_integration(),
+            self.check_network_and_hotspot(),
+        ]
+
+    # ------------------------------------------------------------------ checks
+
+    def check_python_dependencies(self) -> CheckResult:
+        missing = []
+        for module, package in (("yaml", "python3-yaml"), ("gi", "python3-gi")):
+            try:
+                __import__(module)
+            except Exception:  # noqa: BLE001
+                missing.append(package)
+        if missing:
+            return CheckResult(
+                "Environment", "Python dependencies", "FAIL",
+                f"Missing modules: {', '.join(missing)}",
+                fix=f"Install with your package manager: {' '.join(missing)}",
+            )
+        return CheckResult("Environment", "Python dependencies", "PASS",
+                           "PyGObject and PyYAML are importable")
 
     def check_privileged_helper(self) -> CheckResult:
-        """Verifies root ownership, permissions, and location of the privileged helper."""
         if not HELPER_BIN.exists():
             return CheckResult(
-                category="Privilege Separation",
-                name="Privileged Helper Binary",
-                status="FAIL",
-                summary="Helper binary not found at /usr/local/libexec/data-guardian-helper",
-                details="Run installation step: sudo cp scripts/data-guardian-helper /usr/local/libexec/ && sudo chmod 0755 /usr/local/libexec/data-guardian-helper"
+                "Privilege Separation", "Privileged helper", "FAIL",
+                f"Not found at {HELPER_BIN}",
+                fix="Run: sudo ./scripts/install.sh --system",
             )
-
         try:
-            stat_info = os.stat(HELPER_BIN)
-            is_root_owned = (stat_info.st_uid == 0 and stat_info.st_gid == 0)
-            is_executable = bool(stat_info.st_mode & 0o111)
-
-            if not is_root_owned:
-                return CheckResult(
-                    category="Privilege Separation",
-                    name="Privileged Helper Binary",
-                    status="WARN",
-                    summary="Helper binary exists but is not owned by root:root",
-                    details=f"Current ownership UID:{stat_info.st_uid} GID:{stat_info.st_gid}. Fix: sudo chown root:root /usr/local/libexec/data-guardian-helper"
-                )
-
-            if not is_executable:
-                return CheckResult(
-                    category="Privilege Separation",
-                    name="Privileged Helper Binary",
-                    status="FAIL",
-                    summary="Helper binary is not executable",
-                    details="Fix: sudo chmod 0755 /usr/local/libexec/data-guardian-helper"
-                )
-
+            info = HELPER_BIN.stat()
+        except OSError as exc:
+            return CheckResult("Privilege Separation", "Privileged helper", "FAIL",
+                               f"Cannot stat helper: {exc}")
+        if info.st_uid != 0 or info.st_gid != 0:
             return CheckResult(
-                category="Privilege Separation",
-                name="Privileged Helper Binary",
-                status="PASS",
-                summary="Binary installed at /usr/local/libexec/data-guardian-helper (0755, root:root)"
+                "Privilege Separation", "Privileged helper", "FAIL",
+                f"Owned by uid {info.st_uid}/gid {info.st_gid}, must be root:root",
+                fix=f"sudo chown root:root {HELPER_BIN}",
             )
-        except Exception as e:
+        if not info.st_mode & 0o111:
+            return CheckResult("Privilege Separation", "Privileged helper", "FAIL",
+                               "Helper is not executable",
+                               fix=f"sudo chmod 0755 {HELPER_BIN}")
+        world_writable = bool(info.st_mode & 0o022)
+        if world_writable:
+            return CheckResult("Privilege Separation", "Privileged helper", "FAIL",
+                               "Helper is group/other writable",
+                               fix=f"sudo chmod 0755 {HELPER_BIN}")
+        return CheckResult("Privilege Separation", "Privileged helper", "PASS",
+                           f"Installed at {HELPER_BIN} (0755, root:root)")
+
+    def check_helper_capabilities(self) -> CheckResult:
+        """The installed helper must support the actions this version uses."""
+        if not HELPER_BIN.exists():
+            return CheckResult("Privilege Separation", "Helper capabilities", "WARN",
+                               "Helper not installed; cannot verify actions")
+        try:
+            text = HELPER_BIN.read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            return CheckResult("Privilege Separation", "Helper capabilities", "WARN",
+                               f"Cannot read helper: {exc}")
+        required = ["--apply-stdin", "--cgroup-init", "--cgroup-set", "--cgroup-clear", "--flush", "--status"]
+        missing = [flag for flag in required if flag not in text]
+        if missing:
             return CheckResult(
-                category="Privilege Separation",
-                name="Privileged Helper Binary",
-                status="FAIL",
-                summary=f"Failed to stat helper binary: {e}"
+                "Privilege Separation", "Helper capabilities", "FAIL",
+                f"Installed helper is outdated; missing: {', '.join(missing)}",
+                fix="Reinstall the helper: sudo ./scripts/install.sh --system",
             )
+        return CheckResult("Privilege Separation", "Helper capabilities", "PASS",
+                           "All required helper actions are present")
 
     def check_sudoers_rule(self) -> CheckResult:
-        """Verifies passwordless sudo execution of the privileged helper."""
         if not HELPER_BIN.exists():
-            return CheckResult(
-                category="Privilege Separation",
-                name="Sudoers Rule",
-                status="FAIL",
-                summary="Cannot test sudoers: helper binary does not exist"
-            )
-
+            return CheckResult("Privilege Separation", "Sudoers rule", "FAIL",
+                               "Cannot test sudoers without the helper")
         try:
-            start_t = time.perf_counter()
-            res = subprocess.run(
-                ["sudo", "-n", str(HELPER_BIN), "--status"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3
-            )
-            elapsed_ms = (time.perf_counter() - start_t) * 1000
-
-            # returncode 0 (active) or 1 (inactive) means sudo executed passwordlessly!
-            if res.returncode in (0, 1):
-                return CheckResult(
-                    category="Privilege Separation",
-                    name="Sudoers Rule",
-                    status="PASS",
-                    summary=f"Passwordless sudo verified ({elapsed_ms:.1f}ms). Returned '{res.stdout.strip()}'."
-                )
-            else:
-                return CheckResult(
-                    category="Privilege Separation",
-                    name="Sudoers Rule",
-                    status="FAIL",
-                    summary=f"Passwordless sudo failed (exit code {res.returncode}): {res.stderr.strip()}",
-                    details="Verify /etc/sudoers.d/linux-data-guardian with 'sudo visudo -cf /etc/sudoers.d/linux-data-guardian'"
-                )
+            start = time.perf_counter()
+            res = subprocess.run(["sudo", "-n", str(HELPER_BIN), "--status"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, timeout=5, check=False)
+            elapsed = (time.perf_counter() - start) * 1000
         except subprocess.TimeoutExpired:
-            return CheckResult(
-                category="Privilege Separation",
-                name="Sudoers Rule",
-                status="FAIL",
-                summary="Sudo prompted for a password or hung waiting for terminal input.",
-                details="Ensure NOPASSWD is set in /etc/sudoers.d/linux-data-guardian"
-            )
-        except Exception as e:
-            return CheckResult(
-                category="Privilege Separation",
-                name="Sudoers Rule",
-                status="FAIL",
-                summary=f"Error executing sudo check: {e}"
-            )
+            return CheckResult("Privilege Separation", "Sudoers rule", "FAIL",
+                               "sudo prompted for a password (NOPASSWD missing)",
+                               fix=f"sudo visudo -cf {SUDOERS_FILE}")
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("Privilege Separation", "Sudoers rule", "FAIL",
+                               f"sudo check failed: {exc}")
+        if res.returncode in (0, 1):
+            return CheckResult("Privilege Separation", "Sudoers rule", "PASS",
+                               f"Passwordless sudo verified ({elapsed:.1f} ms)")
+        return CheckResult("Privilege Separation", "Sudoers rule", "FAIL",
+                           f"sudo returned {res.returncode}: {res.stderr.strip()}",
+                           fix=f"sudo visudo -cf {SUDOERS_FILE}")
 
-    def check_nftables_isolation(self) -> CheckResult:
-        """Verifies nftables binary and isolation of table inet data_guardian."""
-        nft_path = subprocess.run(["which", "nft"], stdout=subprocess.PIPE, text=True).stdout.strip()
-        if not nft_path:
-            return CheckResult(
-                category="Firewall Isolation",
-                name="Nftables Subsystem",
-                status="FAIL",
-                summary="nftables executable ('nft') not found on system path"
-            )
+    def check_nftables(self) -> CheckResult:
+        nft = shutil.which("nft") or ("/usr/sbin/nft" if Path("/usr/sbin/nft").exists() else "")
+        if not nft:
+            return CheckResult("Firewall Isolation", "nftables", "FAIL",
+                               "nft binary not found",
+                               fix="Install nftables (apt install nftables)")
+        manager = NftablesManager()
+        state = manager.table_present()
+        if state is None:
+            return CheckResult("Firewall Isolation", "nftables", "WARN",
+                               f"nft present at {nft}, but table state could not be read")
+        state_str = "active" if state else "inactive"
+        return CheckResult("Firewall Isolation", "nftables", "PASS",
+                           f"nft present at {nft}; table inet data_guardian is {state_str}",
+                           details="Only 'table inet data_guardian' is ever touched.")
 
-        try:
-            # Query status via helper
-            res = subprocess.run(
-                ["sudo", "-n", str(HELPER_BIN), "--status"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3
-            )
-            table_state = res.stdout.strip() if res.returncode in (0, 1) else "unknown"
-
-            return CheckResult(
-                category="Firewall Isolation",
-                name="Nftables Subsystem",
-                status="PASS",
-                summary=f"nftables present ({nft_path}). Table 'data_guardian' state: {table_state}.",
-                details="Scoped exclusively to 'table inet data_guardian'; system UFW/iptables are untouched."
-            )
-        except Exception as e:
-            return CheckResult(
-                category="Firewall Isolation",
-                name="Nftables Subsystem",
-                status="WARN",
-                summary=f"Could not verify table state: {e}"
-            )
+    def check_strict_cgroups(self) -> CheckResult:
+        if not Path("/sys/fs/cgroup").is_dir():
+            return CheckResult("Firewall Isolation", "Strict-mode cgroups", "WARN",
+                               "cgroup v2 not mounted; strict mode will use the port fallback")
+        manager = NftablesManager()
+        if not manager.can_apply_rules():
+            return CheckResult("Firewall Isolation", "Strict-mode cgroups", "WARN",
+                               "Cannot verify cgroups without helper access")
+        ok = manager.ensure_cgroups()
+        if ok:
+            return CheckResult("Firewall Isolation", "Strict-mode cgroups", "PASS",
+                               "data_guardian/{foreground,whitelist} cgroups are available")
+        return CheckResult("Firewall Isolation", "Strict-mode cgroups", "WARN",
+                           "Could not create cgroups; strict mode falls back to web/SSH ports")
 
     def check_daemon_and_ipc(self) -> CheckResult:
-        """Verifies background daemon process, memory RSS, and IPC socket responsiveness."""
-        # 1. Systemd service status
         svc_active = False
         try:
-            res = subprocess.run(
-                ["systemctl", "is-active", "data-guardian.service"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3
-            )
-            svc_active = (res.stdout.strip() == "active")
-        except Exception:
+            res = subprocess.run(["systemctl", "is-active", "data-guardian.service"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, timeout=3, check=False)
+            svc_active = res.stdout.strip() == "active"
+        except Exception:  # noqa: BLE001
             svc_active = False
 
-        # 2. Process check & Memory RSS
-        pid = None
-        rss_mb = 0.0
+        pid, rss_mb = None, 0.0
         try:
-            pgrep = subprocess.run(
-                ["pgrep", "-f", "src.data_guardian.main daemon"],
-                stdout=subprocess.PIPE,
-                text=True
-            )
-            pids = pgrep.stdout.strip().split()
+            res = subprocess.run(["pgrep", "-f", "src.data_guardian.main daemon"],
+                                 stdout=subprocess.PIPE, text=True, check=False)
+            pids = res.stdout.split()
             if pids:
                 pid = int(pids[0])
-                ps_rss = subprocess.run(
-                    ["ps", "-p", str(pid), "-o", "rss="],
-                    stdout=subprocess.PIPE,
-                    text=True
-                )
-                rss_kb = int(ps_rss.stdout.strip() or 0)
-                rss_mb = rss_kb / 1024.0
-        except Exception:
+                ps = subprocess.run(["ps", "-p", str(pid), "-o", "rss="],
+                                    stdout=subprocess.PIPE, text=True, check=False)
+                rss_mb = (int(ps.stdout.strip() or 0)) / 1024.0
+        except Exception:  # noqa: BLE001
             pass
 
-        # 3. IPC Socket Ping
         sock_path = get_socket_path()
-        ipc_ok = False
         ping_ms = 0.0
+        response = None
         if sock_path.exists():
             try:
-                start_t = time.perf_counter()
-                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                client.settimeout(2.0)
-                client.connect(str(sock_path))
-                client.sendall(json.dumps({"action": "ping"}).encode("utf-8") + b"\n")
-                raw = client.recv(4096)
-                client.close()
-                elapsed = (time.perf_counter() - start_t) * 1000
-                ping_ms = elapsed
-                resp = json.loads(raw.decode("utf-8"))
-                ipc_ok = (resp.get("status") == "ok")
-            except Exception:
-                ipc_ok = False
+                start = time.perf_counter()
+                response = send_ipc_command({"action": "ping"}, timeout=2.0)
+                ping_ms = (time.perf_counter() - start) * 1000
+            except Exception:  # noqa: BLE001
+                response = None
+        ipc_ok = bool(response and response.get("status") == "ok")
 
         if not svc_active and not pid:
-            return CheckResult(
-                category="Daemon & IPC",
-                name="Background Daemon",
-                status="FAIL",
-                summary="Daemon is not running",
-                details="Start with: systemctl start data-guardian.service"
-            )
-
+            return CheckResult("Daemon & IPC", "Background daemon", "FAIL",
+                               "Daemon is not running",
+                               fix="sudo systemctl start data-guardian.service")
         if not ipc_ok:
-            return CheckResult(
-                category="Daemon & IPC",
-                name="Background Daemon",
-                status="WARN",
-                summary=f"Daemon running (PID {pid}, RSS {rss_mb:.1f}MB) but IPC socket unresponsive at {sock_path}",
-                details="Restart daemon: systemctl restart data-guardian.service"
-            )
+            return CheckResult("Daemon & IPC", "Background daemon", "WARN",
+                               f"PID {pid} running but IPC unresponsive at {sock_path}",
+                               fix="sudo systemctl restart data-guardian.service")
 
-        mem_status = "PASS" if rss_mb < 60.0 else "WARN"
-        return CheckResult(
-            category="Daemon & IPC",
-            name="Background Daemon",
-            status=mem_status,
-            summary=f"Running (PID {pid}, Memory: {rss_mb:.1f}MB, IPC roundtrip: {ping_ms:.2f}ms)",
-            details=f"Service: {'active' if svc_active else 'unmanaged'}, Socket: {sock_path}"
-        )
+        status = send_ipc_command({"action": "get_status"})
+        firewall_error = (status or {}).get("firewall_error")
+        if firewall_error:
+            return CheckResult("Daemon & IPC", "Background daemon", "FAIL",
+                               f"Firewall error reported by daemon: {firewall_error}",
+                               details=f"PID {pid}, RSS {rss_mb:.1f} MiB, IPC {ping_ms:.2f} ms")
+        mem_status = "PASS" if rss_mb < 80.0 else "WARN"
+        return CheckResult("Daemon & IPC", "Background daemon", mem_status,
+                           f"PID {pid}, RSS {rss_mb:.1f} MiB, IPC roundtrip {ping_ms:.2f} ms",
+                           details=f"Service: {'active' if svc_active else 'unmanaged'}")
 
     def check_database_integrity(self) -> CheckResult:
-        """Verifies SQLite database integrity, WAL mode, and schema version."""
         db_path = self.config_mgr.db_path
         if not db_path.exists():
-            return CheckResult(
-                category="Data Storage",
-                name="SQLite Database",
-                status="WARN",
-                summary=f"Database file not yet created at {db_path}"
-            )
-
+            return CheckResult("Data Storage", "SQLite database", "WARN",
+                               f"Not created yet at {db_path}")
         try:
             with sqlite3.connect(db_path, timeout=5.0) as conn:
-                cursor = conn.cursor()
-                cursor.execute("PRAGMA integrity_check;")
-                integrity = cursor.fetchone()[0]
+                integrity = conn.execute("PRAGMA integrity_check;").fetchone()[0]
                 if integrity != "ok":
-                    return CheckResult(
-                        category="Data Storage",
-                        name="SQLite Database",
-                        status="FAIL",
-                        summary=f"Database corruption detected: {integrity}",
-                        details=f"Path: {db_path}"
-                    )
+                    return CheckResult("Data Storage", "SQLite database", "FAIL",
+                                       f"Integrity check failed: {integrity}",
+                                       details=f"Path: {db_path}")
+                version = conn.execute("SELECT MAX(version) FROM schema_version;").fetchone()[0]
+                nets = conn.execute("SELECT COUNT(*) FROM network_daily_usage;").fetchone()[0]
+                sessions = conn.execute("SELECT COUNT(*) FROM sessions;").fetchone()[0]
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("Data Storage", "SQLite database", "FAIL", f"Database error: {exc}")
+        if version != CURRENT_SCHEMA_VERSION:
+            return CheckResult("Data Storage", "SQLite database", "WARN",
+                               f"Schema v{version}, expected v{CURRENT_SCHEMA_VERSION}",
+                               details=f"{sessions} sessions, {nets} network-days")
+        return CheckResult("Data Storage", "SQLite database", "PASS",
+                           f"Integrity OK (v{version}): {sessions} sessions, {nets} network-days",
+                           details=f"Path: {db_path}")
 
-                cursor.execute("SELECT MAX(version) FROM schema_version;")
-                ver_row = cursor.fetchone()
-                version = ver_row[0] if ver_row else 1
-
-                # Record statistics
-                cursor.execute("SELECT COUNT(*) FROM network_daily_usage;")
-                net_records = cursor.fetchone()[0]
-
-                cursor.execute("SELECT COUNT(*) FROM sessions;")
-                session_records = cursor.fetchone()[0]
-
-            return CheckResult(
-                category="Data Storage",
-                name="SQLite Database",
-                status="PASS",
-                summary=f"Integrity OK (v{version}). Records: {session_records} sessions, {net_records} network days.",
-                details=f"Path: {db_path} (WAL mode enabled)"
-            )
-        except Exception as e:
-            return CheckResult(
-                category="Data Storage",
-                name="SQLite Database",
-                status="FAIL",
-                summary=f"Database error: {e}"
-            )
+    def check_file_permissions(self) -> CheckResult:
+        problems = []
+        for path, expected in ((self.config_mgr.db_path, 0o600),
+                               (self.config_mgr.config_path, 0o600)):
+            if not path.exists():
+                continue
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                problems.append(f"{path} is {oct(mode)} (want {oct(expected)})")
+        if problems:
+            return CheckResult("Data Storage", "File permissions", "FAIL",
+                               "; ".join(problems),
+                               fix="Run: chmod 600 " + " ".join(str(p) for p in problems))
+        return CheckResult("Data Storage", "File permissions", "PASS",
+                           "Database and config are readable only by the owner")
 
     def check_desktop_integration(self) -> CheckResult:
-        """Verifies desktop icons, autostart launchers, and running tray applet."""
-        icon_path = Path("/usr/share/icons/hicolor/512x512/apps/linux-data-guardian.png")
-        icon_ok = icon_path.exists()
-
-        tray_running = False
+        icon_ok = ICON_FILE.exists()
+        autostart = Path.home() / ".config" / "autostart" / "data-guardian-tray.desktop"
+        autostart_ok = autostart.exists()
         try:
-            res = subprocess.run(["pgrep", "-f", "src.data_guardian.main tray"], stdout=subprocess.PIPE, text=True)
+            res = subprocess.run(["pgrep", "-f", "src.data_guardian.main tray"],
+                                 stdout=subprocess.PIPE, text=True, check=False)
             tray_running = bool(res.stdout.strip())
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            tray_running = False
 
-        autostart_path = Path.home() / ".config" / "autostart" / "data-guardian-tray.desktop"
-        autostart_ok = autostart_path.exists()
-
-        summary_parts = []
-        summary_parts.append(f"Icon: {'installed' if icon_ok else 'missing'}")
-        summary_parts.append(f"Tray applet: {'running' if tray_running else 'inactive'}")
-        summary_parts.append(f"Autostart: {'configured' if autostart_ok else 'disabled'}")
-
-        status = "PASS" if (icon_ok and tray_running) else "WARN"
-        return CheckResult(
-            category="Desktop Integration",
-            name="Tray & UI Components",
-            status=status,
-            summary="; ".join(summary_parts)
-        )
+        summary = (f"icon {'installed' if icon_ok else 'missing'}; "
+                   f"tray {'running' if tray_running else 'inactive'}; "
+                   f"autostart {'configured' if autostart_ok else 'disabled'}")
+        status = "PASS" if (icon_ok and autostart_ok) else "WARN"
+        fix = None if status == "PASS" else "sudo ./scripts/install.sh --system && ./scripts/install.sh"
+        return CheckResult("Desktop Integration", "Tray & icons", status, summary, fix=fix)
 
     def check_network_and_hotspot(self) -> CheckResult:
-        """Verifies active NetworkManager connection and designated hotspot designation."""
         monitor = NetworkMonitor(
             designated_uuid=self.config_mgr.designated_hotspot_uuid,
-            designated_name=self.config_mgr.designated_hotspot_name
+            designated_name=self.config_mgr.designated_hotspot_name,
         )
-        active_conn = monitor.get_active_connection()
-        hotspot_uuid = self.config_mgr.designated_hotspot_uuid
-        hotspot_name = self.config_mgr.designated_hotspot_name
-
-        if not active_conn:
-            return CheckResult(
-                category="Network Monitor",
-                name="Active Connection",
-                status="WARN",
-                summary="No active Wi-Fi or Ethernet connection detected",
-                details=f"Configured Hotspot: {hotspot_name or 'None'} ({hotspot_uuid or 'Not set'})"
-            )
-
-        is_hotspot = monitor.is_designated_hotspot_active()
-        mode_str = "METERED (Hotspot Active)" if is_hotspot else "UNMETERED"
-
+        active = monitor.get_active_connection()
+        if not active:
+            return CheckResult("Network Monitor", "Active connection", "WARN",
+                               "No active Wi-Fi or Ethernet connection",
+                               details=f"Designated hotspot: {self.config_mgr.designated_hotspot_name or 'unset'}")
+        is_hotspot = monitor.matches_designated(active)
         return CheckResult(
-            category="Network Monitor",
-            name="Active Connection",
-            status="PASS",
-            summary=f"Connected to '{active_conn.name}' on {active_conn.interface} [{mode_str}]",
-            details=f"UUID: {active_conn.uuid} | Designated Hotspot: {hotspot_name or hotspot_uuid or 'None'}"
+            "Network Monitor", "Active connection", "PASS",
+            f"'{active.name}' on {active.interface} "
+            f"[{'METERED' if is_hotspot else 'unmetered'}]",
+            details=f"UUID {active.uuid}; designated hotspot "
+                    f"{self.config_mgr.designated_hotspot_name or self.config_mgr.designated_hotspot_uuid or 'unset'}",
         )
 
 
-def format_cli_report(results: List[CheckResult], color: bool = True) -> str:
-    """Renders a formatted, human-readable terminal report."""
-    # Terminal ANSI color escape codes
-    GREEN = "\033[92m" if color else ""
-    YELLOW = "\033[93m" if color else ""
-    RED = "\033[91m" if color else ""
-    CYAN = "\033[96m" if color else ""
-    BOLD = "\033[1m" if color else ""
-    RESET = "\033[0m" if color else ""
+# ------------------------------------------------------------------- reporting
 
-    lines = [
-        f"{BOLD}{CYAN}══════════════════════════════════════════════════════════════════════════════{RESET}",
-        f"{BOLD}{CYAN}                   Linux Data Guardian Doctor — Health Report                  {RESET}",
-        f"{BOLD}{CYAN}══════════════════════════════════════════════════════════════════════════════{RESET}",
-        ""
-    ]
+_MARKS = {"PASS": ("\033[92m", "PASS"), "WARN": ("\033[93m", "WARN"), "FAIL": ("\033[91m", "FAIL")}
 
-    pass_count = sum(1 for r in results if r.status == "PASS")
-    warn_count = sum(1 for r in results if r.status == "WARN")
-    fail_count = sum(1 for r in results if r.status == "FAIL")
 
+def format_report(results: List[CheckResult], color: bool = True) -> str:
+    reset = "\033[0m" if color else ""
+    bold = "\033[1m" if color else ""
+    lines = [f"{bold}Linux Data Guardian — doctor{reset}", ""]
     for r in results:
-        if r.status == "PASS":
-            tag = f"{GREEN}[✓ PASS]{RESET}"
-        elif r.status == "WARN":
-            tag = f"{YELLOW}[⚠ WARN]{RESET}"
-        else:
-            tag = f"{RED}[✗ FAIL]{RESET}"
-
-        lines.append(f"{tag} {BOLD}{r.name:<25}{RESET} ({r.category})")
-        lines.append(f"       {r.summary}")
+        prefix, label = _MARKS.get(r.status, ("", r.status))
+        tag = f"{prefix}[{label}]{reset}" if color else f"[{label}]"
+        lines.append(f"{tag} {bold}{r.name}{reset} ({r.category})")
+        lines.append(f"      {r.summary}")
         if r.details:
-            lines.append(f"       {r.details}")
+            lines.append(f"      {r.details}")
+        if r.fix and r.status != "PASS":
+            lines.append(f"      fix: {r.fix}")
         lines.append("")
-
-    lines.append(f"{BOLD}Summary:{RESET} {GREEN}{pass_count} Passed{RESET}, {YELLOW}{warn_count} Warnings{RESET}, {RED}{fail_count} Failed{RESET}")
-    if fail_count == 0:
-        lines.append(f"{BOLD}{GREEN}All critical security boundaries and subsystem components are healthy!{RESET}")
-    else:
-        lines.append(f"{BOLD}{RED}Some critical checks failed. Please inspect the recommendations above.{RESET}")
-
-    lines.append(f"{BOLD}{CYAN}══════════════════════════════════════════════════════════════════════════════{RESET}")
+    passed = sum(1 for r in results if r.status == "PASS")
+    warned = sum(1 for r in results if r.status == "WARN")
+    failed = sum(1 for r in results if r.status == "FAIL")
+    lines.append(f"{bold}Summary:{reset} {passed} passed, {warned} warnings, {failed} failed")
     return "\n".join(lines)
+
+
+def run_doctor(as_json: bool = False, color: bool = True) -> int:
+    """Return a process exit code: 0 healthy, 2 warnings, 1 failures."""
+    results = Doctor().run_all()
+    if as_json:
+        print(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        print(format_report(results, color=color))
+    if any(r.status == "FAIL" for r in results):
+        return 1
+    if any(r.status == "WARN" for r in results):
+        return 2
+    return 0

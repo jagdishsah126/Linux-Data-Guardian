@@ -63,7 +63,7 @@ class TestUISync(unittest.TestCase):
              patch.object(DataGuardianTray, "_init_appindicator", lambda self: None), \
              patch.object(DataGuardianTray, "_init_gtk_status_icon", lambda self: None), \
              patch.object(DataGuardianTray, "_refresh_tray", lambda self: None), \
-             patch("src.data_guardian.ui.tray.send_ipc_command") as mock_ipc:
+             patch("src.data_guardian.ui.tray.ipc_async") as mock_ipc:
             
             tray = DataGuardianTray()
             self.assertFalse(tray._loading_profile)
@@ -73,10 +73,18 @@ class TestUISync(unittest.TestCase):
             tray._on_profile_selected("strict", True)
             mock_ipc.assert_not_called()
 
-            # When loading_profile is False, callback sends IPC
+            # Inactive toggles (radio group updates) must not send either.
             tray._loading_profile = False
+            tray._on_profile_selected("strict", False)
+            mock_ipc.assert_not_called()
+
+            # When loading_profile is False, the request goes out off the UI thread.
             tray._on_profile_selected("strict", True)
-            mock_ipc.assert_called_with({"action": "set_profile", "profile": "strict"})
+            mock_ipc.assert_called_once()
+            self.assertEqual(
+                mock_ipc.call_args.args[0],
+                {"action": "set_profile", "profile": "strict"},
+            )
 
 
 if __name__ == "__main__":

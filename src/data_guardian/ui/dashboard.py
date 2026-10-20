@@ -11,25 +11,46 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Pango
 
 from src.data_guardian.ipc import send_ipc_command
+from src.data_guardian.ui.async_ipc import ipc_async
 from src.data_guardian.database import Database
 from src.data_guardian.config import ConfigManager
 from src.data_guardian.network.byte_counter import format_bytes
 from src.data_guardian.network.nm_monitor import NetworkMonitor
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Matplotlib setup (lazy import inside Statistics tab to avoid slowing startup)
+# Matplotlib is imported lazily, only when the Statistics tab is built, so the
+# dashboard starts fast and does not pay ~1s / ~40 MB for a tab you may not open.
 # ──────────────────────────────────────────────────────────────────────────────
 _MPL_AVAILABLE = False
-try:
-    import matplotlib
-    matplotlib.use("GTK3Agg")
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_gtk3agg import FigureCanvasGTK3Agg as FigureCanvas
-    import matplotlib.dates as mdates
-    from datetime import datetime as dt_cls
-    _MPL_AVAILABLE = True
-except Exception:
-    pass
+_MPL_LOADED = False
+Figure = None            # type: ignore[assignment]
+FigureCanvas = None      # type: ignore[assignment]
+mdates = None            # type: ignore[assignment]
+
+
+def load_matplotlib() -> bool:
+    """Import matplotlib on first use. Returns True when the chart can be drawn."""
+    global _MPL_AVAILABLE, _MPL_LOADED, Figure, FigureCanvas, mdates
+    if _MPL_LOADED:
+        return _MPL_AVAILABLE
+    _MPL_LOADED = True
+    try:
+        import matplotlib
+
+        matplotlib.use("GTK3Agg")
+        from matplotlib import dates as _mdates
+        from matplotlib.backends.backend_gtk3agg import FigureCanvasGTK3Agg as _FigureCanvas
+        from matplotlib.figure import Figure as _Figure
+
+        Figure = _Figure
+        FigureCanvas = _FigureCanvas
+        mdates = _mdates
+        _MPL_AVAILABLE = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[i] matplotlib unavailable, Statistics chart disabled: {exc}")
+        _MPL_AVAILABLE = False
+    return _MPL_AVAILABLE
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI command definitions shown in CLI tab
@@ -71,14 +92,15 @@ CLI_COMMANDS = [
             {
                 "label": "Set Profile: Balanced",
                 "cmd": "data-guardian profile balanced",
-                "desc": "BALANCED: Silences background updaters (APT auto-fetch, snap, Flatpak sync). "
-                        "You can browse freely. Only unattended background downloads are blocked.",
+                "desc": "BALANCED: Browsing works normally; new APT (UID 42) connections are "
+                        "dropped while metered. Snap/Flatpak run as your user and are not blocked.",
             },
             {
                 "label": "Set Profile: Strict",
                 "cmd": "data-guardian profile strict",
-                "desc": "STRICT: Only the foreground app you are actively using gets network access. "
-                        "All other apps are firewalled. Great for saving data when on limited SIM data.",
+                "desc": "STRICT: Only the focused X11 app and the allowlisted tools "
+                        "(opencode, antigravity) may open new connections. Without cgroup v2 "
+                        "it falls back to ports 22/80/443.",
             },
             {
                 "label": "Set Profile: Off",
@@ -191,6 +213,9 @@ class DashboardWindow(Gtk.Window):
         self._saved_connections: List[Dict[str, Any]] = []
         # Track whether profile radio change is from code (suppress IPC ping)
         self._loading_profile = False
+        # Last daemon snapshot, refreshed once per timer tick
+        self._status: Dict[str, Any] = {}
+        self._refresh_inflight = False
 
         self.set_default_size(640, 620)
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -243,7 +268,6 @@ class DashboardWindow(Gtk.Window):
         self.live_conn_label.set_ellipsize(Pango.EllipsizeMode.END)
         outer.pack_start(self.live_conn_label, False, False, 2)
 
-        Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL).show()
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 6)
 
         # ── Network Selector Frame ─────────────────────────────────────────
@@ -302,14 +326,14 @@ class DashboardWindow(Gtk.Window):
         btn_100.connect("clicked", lambda b: self._grant_allowance(100))
         btn_500 = Gtk.Button(label="+500 MB")
         btn_500.connect("clicked", lambda b: self._grant_allowance(500))
-        btn_apt = Gtk.Button(label="📦 Allow APT")
-        btn_apt.set_tooltip_text("Open a temporary 15-minute window for apt update / apt install on mobile data")
-        btn_apt.connect("clicked", lambda b: self._allow_apt_window())
+        self.btn_apt = Gtk.Button(label="📦 Allow APT (15m)")
+        self.btn_apt.set_tooltip_text("Open a timed window for apt update / apt install on mobile data")
+        self.btn_apt.connect("clicked", lambda b: self._allow_apt_window())
         btn_bypass = Gtk.Button(label="🚨 Bypass")
         btn_bypass.connect("clicked", self._emergency_bypass)
         btn_box.pack_start(btn_100, True, True, 0)
         btn_box.pack_start(btn_500, True, True, 0)
-        btn_box.pack_start(btn_apt, True, True, 0)
+        btn_box.pack_start(self.btn_apt, True, True, 0)
         btn_box.pack_start(btn_bypass, True, True, 0)
         usage_box.pack_start(btn_box, False, False, 4)
 
@@ -354,6 +378,8 @@ class DashboardWindow(Gtk.Window):
         self.log_list = Gtk.ListBox()
         scrolled.add(self.log_list)
         log_box.pack_start(scrolled, True, True, 0)
+        outer.pack_start(log_frame, False, False, 0)
+
         # Now that all UI frames (usage, profile, network) are instantiated,
         # connect signals and populate the combo box with active network stats:
         self.combo_networks.connect("changed", self._on_network_selected)
@@ -364,15 +390,15 @@ class DashboardWindow(Gtk.Window):
     def _profile_description(self, profile: str) -> str:
         if profile == "balanced":
             return (
-                "<small><span foreground='#b8860b'>⚖️  <b>Balanced</b>: Browsing is unrestricted. "
-                "Background updaters (APT, snap, Flatpak auto-sync) are silenced. "
+                "<small><span foreground='#b8860b'>⚖️  <b>Balanced</b>: Browsing works normally. "
+                "New APT (UID 42) connections are dropped while metered; other apps are not filtered. "
                 "Best for everyday use on hotspot.</span></small>"
             )
         elif profile == "strict":
             return (
-                "<small><span foreground='#1565c0'>🔒  <b>Strict (Experimental)</b>: In this stage, "
-                "background updates are silenced while cgroup process hierarchy tracking is being stabilized. "
-                "Safe, maximum background data saving.</span></small>"
+                "<small><span foreground='#1565c0'>🔒  <b>Strict</b>: Only the focused X11 app and "
+                "the allowlisted tools (opencode, antigravity) may open new connections. Without "
+                "cgroup v2, a TCP port allowlist (22/80/443) is used instead.</span></small>"
             )
         else:
             return (
@@ -404,8 +430,8 @@ class DashboardWindow(Gtk.Window):
         # Target selection: 1. preferred_uuid -> 2. currently active network -> 3. designated hotspot -> 4. first network
         target_uuid = preferred_uuid or self._selected_uuid
         if not target_uuid:
-            status = send_ipc_command({"action": "get_status"})
-            if status and status.get("connection_uuid"):
+            status = self._status or {}
+            if status.get("connection_uuid"):
                 target_uuid = status["connection_uuid"]
             elif desig_uuid:
                 target_uuid = desig_uuid
@@ -437,60 +463,57 @@ class DashboardWindow(Gtk.Window):
         """Set the currently selected network as the designated hotspot."""
         if not self._selected_uuid:
             return
-        # Find name
         name = next(
             (c["name"] for c in self._saved_connections if c["uuid"] == self._selected_uuid),
-            self._selected_uuid[:8]
+            self._selected_uuid[:8],
         )
-        self.config_mgr.designated_hotspot_uuid = self._selected_uuid
-        if "hotspot" not in self.config_mgr.config:
-            self.config_mgr.config["hotspot"] = {}
-        self.config_mgr.config["hotspot"]["designated_name"] = name
-        self.config_mgr.save_user_config()
-        send_ipc_command({"action": "set_hotspot_uuid", "uuid": self._selected_uuid})
-        # Refresh combo to update star while preserving currently active selection
-        curr = self._selected_uuid
-        self._populate_network_combo(preferred_uuid=curr)
+        self.config_mgr.set_hotspot(self._selected_uuid, name)
+        ipc_async(
+            {"action": "set_hotspot_uuid", "uuid": self._selected_uuid, "name": name},
+            lambda _r: self._populate_network_combo(preferred_uuid=self._selected_uuid),
+        )
 
     def _refresh_network_panel(self, uuid: str) -> None:
-        """Refresh the usage stats and profile radio for the given network UUID."""
-        # Usage stats for this network today
+        """Refresh the selected network's stats and profile widgets (never writes config)."""
         usage = self.db.get_network_today_usage(uuid)
         rx = usage.get("rx_bytes", 0)
         tx = usage.get("tx_bytes", 0)
         total = usage.get("total_bytes", 0)
         limit_bytes = self.config_mgr.daily_limit_mb * 1024 * 1024
+        is_metered = bool(usage.get("metered"))
 
         self.rx_label.set_text(f"↓ Download: {format_bytes(rx)}")
         self.tx_label.set_text(f"↑ Upload:   {format_bytes(tx)}")
-        self.usage_label.set_text(
-            f"Total: {format_bytes(total)}  /  Daily Limit: {format_bytes(limit_bytes)}"
-        )
-        frac = min(total / limit_bytes, 1.0) if limit_bytes > 0 else 0.0
-        self.progress_bar.set_fraction(frac)
-        self.progress_bar.set_text(f"{int(frac * 100)}%")
 
-        # Hotspot indicator
+        if is_metered and limit_bytes > 0:
+            self.usage_label.set_text(
+                f"Total: {format_bytes(total)}  /  Daily Limit: {format_bytes(limit_bytes)}"
+            )
+            frac = min(total / limit_bytes, 1.0)
+            self.progress_bar.set_text(f"{int(frac * 100)}%")
+        else:
+            self.usage_label.set_text(f"Total: {format_bytes(total)}  /  unmetered — no quota")
+            frac = 0.0
+            self.progress_bar.set_text("n/a")
+        self.progress_bar.set_fraction(frac)
+
         desig = self.config_mgr.designated_hotspot_uuid
         if uuid == desig:
             self.hotspot_indicator.set_markup(
-                "<span foreground='orange'><b>⭐ This is your designated metered hotspot — "
-                "data saving rules apply when connected here.</b></span>"
+                "<span foreground='orange'><b>⭐ Designated metered hotspot — "
+                "data saving rules apply here.</b></span>"
             )
         else:
             self.hotspot_indicator.set_markup(
                 "<span foreground='green'>Regular (unmetered) network — "
-                "no restrictions applied by default.</span>"
+                "no restrictions are applied here.</span>"
             )
 
-        # Profile radio (per-network)
-        # If this is the active network, sync with live daemon profile if available
-        status = send_ipc_command({"action": "get_status"})
-        active_uuid = status.get("connection_uuid", "") if status else ""
-        if uuid == active_uuid and status and "current_profile" in status:
-            saved_profile = status["current_profile"]
-            if self.config_mgr.get_network_profile(uuid) != saved_profile:
-                self.config_mgr.set_network_profile(uuid, saved_profile)
+        # Read the profile from config; the daemon snapshot is the authority for
+        # the *active* network only, and we never persist from a refresh.
+        status = self._status or {}
+        if uuid and uuid == status.get("connection_uuid"):
+            saved_profile = status.get("current_profile", self.config_mgr.get_network_profile(uuid))
         else:
             saved_profile = self.config_mgr.get_network_profile(uuid)
 
@@ -509,31 +532,45 @@ class DashboardWindow(Gtk.Window):
     def _on_profile_toggled(self, profile_name: str, is_active: bool) -> None:
         if not is_active or self._loading_profile:
             return
-        # Save profile for this specific network
-        if self._selected_uuid:
-            self.config_mgr.set_network_profile(self._selected_uuid, profile_name)
-        # Also update the global active profile (daemon uses this)
-        send_ipc_command({"action": "set_profile", "profile": profile_name})
+        if not self._selected_uuid:
+            return
+        # Per-network: never change the global default or another network's profile.
+        self.config_mgr.set_network_profile(self._selected_uuid, profile_name)
         self.profile_desc_label.set_markup(self._profile_description(profile_name))
+        ipc_async({"action": "set_network_profile",
+                   "uuid": self._selected_uuid,
+                   "profile": profile_name},
+                  lambda _r: GLib.timeout_add(400, self._refresh_overview))
 
     def _grant_allowance(self, mb: int) -> None:
-        send_ipc_command({"action": "grant_allowance", "mb": mb})
-        GLib.timeout_add(500, self._refresh_overview)
+        ipc_async({"action": "grant_allowance", "mb": mb},
+                  lambda _r: GLib.timeout_add(400, self._refresh_overview))
 
     def _allow_apt_window(self) -> None:
-        resp = send_ipc_command({"action": "allow_apt_window"})
-        GLib.timeout_add(500, self._refresh_overview)
+        ipc_async({"action": "allow_apt_window"},
+                  lambda _r: GLib.timeout_add(400, self._refresh_overview))
 
     def _emergency_bypass(self, _widget: Gtk.Widget) -> None:
-        send_ipc_command({"action": "emergency_bypass"})
-        self._loading_profile = True
-        self.radio_off.set_active(True)
-        self._loading_profile = False
-        GLib.timeout_add(500, self._refresh_overview)
+        ipc_async({"action": "emergency_bypass"},
+                  lambda _r: GLib.timeout_add(400, self._refresh_overview))
 
     def _refresh_overview(self) -> bool:
-        """Periodic refresh — updates banner and live conn label from daemon."""
-        status = send_ipc_command({"action": "get_status"})
+        """Start a daemon poll in a worker thread; never block the GTK thread."""
+        if self._refresh_inflight:
+            return True
+        self._refresh_inflight = True
+
+        def worker() -> None:
+            status = send_ipc_command({"action": "get_status"}, timeout=2.0)
+            GLib.idle_add(self._apply_overview, status)
+
+        threading.Thread(target=worker, daemon=True, name="dg-dashboard-poll").start()
+        return True
+
+    def _apply_overview(self, status: Optional[Dict[str, Any]]) -> bool:
+        """Apply a poll result on the GTK main thread."""
+        self._refresh_inflight = False
+        self._status = status or {}
 
         if not status:
             self.status_banner.set_markup(
@@ -546,9 +583,15 @@ class DashboardWindow(Gtk.Window):
             conn_name = status.get("connection_name", "Disconnected")
             profile = status.get("current_profile", "balanced")
             is_blocked = status.get("is_quota_blocked", False)
-            iface = status.get("interface", "")
+            firewall_error = status.get("firewall_error")
+            iface = status.get("connection_interface", "")
 
-            if is_hotspot:
+            if firewall_error:
+                self.status_banner.set_markup(
+                    f"<b><big>Linux Data Guardian</big></b>\n"
+                    f"<span foreground='red'><b>⚠ PROTECTION FAILED: {firewall_error[:80]}</b></span>"
+                )
+            elif is_hotspot:
                 color = {"balanced": "orange", "strict": "#1565c0"}.get(profile, "gray")
                 blocked_txt = "  <span foreground='red'><b>— QUOTA EXCEEDED</b></span>" if is_blocked else ""
                 self.status_banner.set_markup(
@@ -563,20 +606,17 @@ class DashboardWindow(Gtk.Window):
                 )
 
             active_app = status.get("active_app", "")
+            apt_left = int(status.get("apt_window_remaining", 0) or 0)
+            extra = f" | APT window {apt_left // 60 + 1} min" if apt_left else ""
             self.live_conn_label.set_text(
-                f"Active: {conn_name}  ({iface})  "
-                + (f" | Focused App: {active_app}" if active_app else "")
+                f"Active: {conn_name}  ({iface})"
+                + (f" | Focused: {active_app}" if active_app and active_app != "unknown" else "")
+                + extra
             )
 
-            # Deliver desktop notifications queued by daemon
-            for note in status.get("notifications", []):
-                try:
-                    subprocess.run(
-                        ["notify-send", "-u", note.get("urgency", "normal"), note.get("title", "Linux Data Guardian"), note.get("message", "")],
-                        check=False
-                    )
-                except Exception:
-                    pass
+            self.btn_apt.set_label(
+                f"📦 Close APT ({apt_left // 60 + 1}m)" if apt_left else "📦 Allow APT (15m)"
+            )
 
         # Auto-select active network if _selected_uuid is somehow not initialized
         if not self._selected_uuid and self._saved_connections:
@@ -590,7 +630,7 @@ class DashboardWindow(Gtk.Window):
             self._refresh_network_panel(self._selected_uuid)
 
         self._update_log_list()
-        return True  # keep timer alive
+        return False  # one-shot GLib.idle_add callback
 
     def _update_log_list(self) -> None:
         for child in self.log_list.get_children():
@@ -621,6 +661,7 @@ class DashboardWindow(Gtk.Window):
     def _build_statistics_tab(self) -> Gtk.Widget:
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         outer.set_border_width(10)
+        load_matplotlib()
 
         # Controls row
         ctrl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)

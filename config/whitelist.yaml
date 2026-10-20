@@ -1,40 +1,20 @@
-# Linux Data Guardian — Whitelist Configuration
-# Defines applications, processes, and network ports permitted during Data Saver mode
+# Linux Data Guardian — Whitelist / Strict-mode policy
+#
+# Strict mode allows new outbound connections ONLY from:
+#   1. the process tree of the focused window, and
+#   2. the process trees listed below.
+# Everything else on the metered interface is dropped.
+#
+# If cgroup v2 delegation is unavailable, strict mode falls back to the TCP
+# port allowlist at the bottom of this file.
 
-whitelist:
-  # Background command-line developer tools permitted to access network
-  # even in Strict (Foreground-Only) mode
-  developer_cli:
-    - opencode
-    - antigravity
-    - git
-    - ssh
-    - python3
+strict_whitelist_processes:
+  - opencode
+  - antigravity
 
-  # Web browsers permitted in Balanced Data Saver mode
-  browsers:
-    - brave
-    - brave-browser
-    - firefox
-    - google-chrome
-    - chromium
-
-  # Essential system network services
-  essential_services:
-    - systemd-resolved
-    - avahi-daemon
-    - cupsd
-
-  # Network ports and protocols always permitted
-  allowed_ports:
-    udp:
-      - 53      # DNS
-      - 67      # DHCP Client
-      - 68      # DHCP Server
-      - 123     # NTP (Time Sync)
-    tcp:
-      - 53      # DNS over TCP
-
-  # Always unrestricted interfaces
-  allowed_interfaces:
-    - lo        # Loopback
+# Extra TCP ports allowed in the strict fallback (DNS/HTTP/HTTPS/SSH are
+# always included by the firewall renderer).
+strict_allowed_ports_tcp:
+  - 22
+  - 80
+  - 443
