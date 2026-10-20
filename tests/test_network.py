@@ -14,9 +14,9 @@ class TestNmcliParsing(unittest.TestCase):
 
     def test_ssid_with_colon(self):
         """BUG-30: an SSID containing ':' must not shift the fields."""
-        line = r"uuid-1:Good Day\: 5G:802-11-wireless:wlan0"
+        line = r"uuid-1:Example Wi-Fi\: 5G:802-11-wireless:wlan0"
         self.assertEqual(split_nmcli_line(line),
-                         ["uuid-1", "Good Day: 5G", "802-11-wireless", "wlan0"])
+                         ["uuid-1", "Example Wi-Fi: 5G", "802-11-wireless", "wlan0"])
 
     def test_escaped_backslash(self):
         line = r"uuid:Name\\:802-3-ethernet:eth0"
@@ -31,10 +31,10 @@ class TestConnectionMatching(unittest.TestCase):
     def test_matches_by_uuid_then_name(self):
         from src.data_guardian.network.nm_monitor import NetworkMonitor
 
-        conn = ConnectionInfo("u1", "Good Day", "802-11-wireless", "wlan0", True)
+        conn = ConnectionInfo("u1", "Example Wi-Fi", "802-11-wireless", "wlan0", True)
         monitor = NetworkMonitor(designated_uuid="u1")
         self.assertTrue(monitor.matches_designated(conn))
-        monitor = NetworkMonitor(designated_uuid="", designated_name="good day")
+        monitor = NetworkMonitor(designated_uuid="", designated_name="example wi-fi")
         self.assertTrue(monitor.matches_designated(conn))
         monitor = NetworkMonitor(designated_uuid="other")
         self.assertFalse(monitor.matches_designated(conn))

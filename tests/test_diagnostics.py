@@ -134,7 +134,7 @@ class TestDeployScript(unittest.TestCase):
 
     def test_deploy_copies_only_runtime_trees(self):
         text = (ROOT / "scripts" / "deploy.sh").read_text()
-        for included in ("/src/", "/scripts/", "/config/", "/systemd/", "/assets/"):
+        for included in ("/src/", "/scripts/", "/config/", "/systemd/", "/assets/", "/File.md"):
             self.assertIn(included, text)
 
 

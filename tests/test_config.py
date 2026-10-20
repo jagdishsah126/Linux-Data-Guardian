@@ -35,10 +35,10 @@ class TestConfigDefaults(IsolatedTestCase):
         self.assertEqual(self.config.get_network_profile("never-seen"), "off")
 
     def test_set_hotspot_writes_name_and_uuid(self):
-        self.config.set_hotspot("uuid-1", "Good Day")
+        self.config.set_hotspot("uuid-1", "Example Wi-Fi")
         self.assertEqual(self.config.designated_hotspot_uuid, "uuid-1")
-        self.assertEqual(self.config.designated_hotspot_name, "Good Day")
-        self.assertEqual(self.config.get_network_name("uuid-1"), "Good Day")
+        self.assertEqual(self.config.designated_hotspot_name, "Example Wi-Fi")
+        self.assertEqual(self.config.get_network_name("uuid-1"), "Example Wi-Fi")
 
     def test_config_file_is_private(self):
         self.assertEqual(self.config_path.stat().st_mode & 0o777, 0o600)

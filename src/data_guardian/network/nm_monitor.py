@@ -31,7 +31,7 @@ def split_nmcli_line(line: str) -> List[str]:
     """Split an ``nmcli -t`` line on unescaped colons.
 
     nmcli escapes embedded colons (and backslashes) with a backslash, so a naive
-    ``split(':')`` corrupts SSIDs such as ``Good Day: 5G``.
+    ``split(':')`` corrupts SSIDs such as ``Example Hotspot: 5G``.
     """
     fields: List[str] = []
     current: List[str] = []

@@ -1,112 +1,197 @@
 # Linux Data Guardian
 
-A local-first data guard for Linux laptops that sometimes run on a phone
-hotspot. It watches NetworkManager, counts bytes from `/proc/net/dev`, enforces
-quotas with an isolated `nftables` table, and gates package-manager downloads
-while the designated metered connection is active.
+A local-first data guard for Linux laptops that sometimes use a phone hotspot.
+It watches NetworkManager, counts bytes from `/proc/net/dev`, enforces quotas
+with an isolated `nftables` table, and asks before package managers download on
+a metered connection.
 
-Nothing leaves your machine: there is no telemetry, account, cloud service, or
-network listener beyond a user-only Unix socket.
+There is no account, cloud service, telemetry, or network listener. Everything
+runs locally and the only socket is a user-only Unix socket.
+
+> New to the codebase? Read **[File.md](File.md)** after this README. It explains
+> every file, what it does, how it works, and why it exists.
 
 ---
 
-## What it actually does
+## What it does
 
-* **Metered networks only.** Restrictions apply when NetworkManager reports the
-  connection UUID/name you designated. Home and office networks are untouched
-  and their traffic is still counted separately.
-* **Metered-only quotas.** Daily and monthly budgets sum only rows recorded
-  while the designated hotspot was active. Ordinary Wi-Fi usage cannot consume
-  your mobile budget.
-* **Two enforcement profiles plus off:**
+- **Metered networks only.** Restrictions apply when the connection you marked
+  as your hotspot is active. Home and office networks remain untouched.
+- **Metered-only quota.** Daily and monthly budgets count only traffic recorded
+  while the designated hotspot was active.
+- **Three profiles.** `balanced`, `strict`, and `off`.
+- **Quota warnings and enforcement.** Warn at the configured thresholds and
+  optionally block new outbound traffic when the budget is exhausted.
+- **APT window.** Open a temporary timed window for `apt update` / `apt install`
+  without disabling the rest of the protection.
+- **Download approval for CLI tools.** `pip`, `pip3`, `npm`, and `cargo` shims
+  ask before download-style commands on a metered connection.
+- **Local history.** SQLite in WAL mode, owner-only permissions, automatic
+  pruning.
+- **CLI, GTK dashboard, and tray icon.**
 
-  | Profile | Behaviour on the metered interface |
-  | :--- | :--- |
-  | `balanced` (default) | Allows established connections, DNS/DHCP/NTP, and all normal user traffic. New connections owned by UID 42 (APT) are dropped. |
-  | `strict` | Only new connections from the focused X11 application's cgroup or the whitelisted tools (`opencode`, `antigravity`) are allowed. Without cgroup v2 delegation it falls back to a TCP port allowlist (22, 80, 443). Everything else is dropped. |
-  | `off` | Monitoring only; the `data_guardian` table is removed. |
+### Profiles
 
-* **Quota enforcement.** At 80% and 95% of the daily budget you get one
-  notification per threshold per day. At 100% (or when the monthly budget is
-  reached) new outbound traffic is paused unless `action_on_exhaustion` is
-  `warn_only`. A manually granted allowance raises today's effective limit.
-* **Temporary APT window.** APT downloads are blocked while metered. Use
-  `data-guardian allow-apt` (or the tray item) to open a timed window (default
-  15 minutes, maximum 120). It closes automatically and the rules are
-  re-applied. There is **no** root-owned APT hook or root Python import.
-* **Download approval for CLI tools.** shims for `pip`, `pip3`, `npm`, and
-  `cargo` ask for confirmation before download-style commands on a metered
-  connection. Read-only commands (`pip list`, `npm --version`, ...) pass
-  straight through.
-* **Local history.** SQLite in WAL mode with 0600 permissions, pruned after 90
-  days by default.
-* **Status, dashboard, and tray.** A CLI (`status --json`), a GTK3 dashboard,
-  and an XApp/AppIndicator/GTK status icon.
+| Profile | Behaviour on the metered interface |
+| :--- | :--- |
+| `balanced` (default) | Normal browsing works. New connections owned by APT's `_apt` user (UID 42) are dropped. |
+| `strict` | Only new connections from the focused X11 application tree and the allowlisted tools (`opencode`, `antigravity`) are allowed. Everything else is dropped. |
+| `off` | Monitoring only. The `data_guardian` firewall table is removed. |
 
-### Known limitations
+Strict mode uses cgroup v2 when available. If cgroup matching cannot be set up,
+it falls back to a TCP port allowlist (default `22`, `80`, `443`).
 
-* Strict-mode focus tracking is X11-only. On Wayland the focused-app cgroup is
-  unavailable, so use `balanced` or the port fallback.
-* cgroup matching requires cgroup v2 and the privileged helper. The installer
-  installs it; `data-guardian doctor` reports whether it is usable.
-* The APT window is a time box, not a package inspection: it allows UID 42 new
-  connections for the chosen duration.
-* The dashboard's chart requires `python3-matplotlib`; without it the rest of
-  the dashboard still works.
-* Memory use is tens of MiB, not the 35 MB claimed by earlier drafts. Measured
-  RSS on Linux Mint XFCE (Python 3.12 + GTK3) was about 49 MiB for the daemon
-  and 86–129 MiB for the GTK tray/dashboard clients, depending on GTK caches.
+> Strict mode's focused-application tracking is **X11-only**. On Wayland, use
+> `balanced` or `off`; the foreground cgroup cannot be tracked.
 
 ---
 
 ## Requirements
 
-* Linux with systemd, NetworkManager (`nmcli`), nftables, and Python 3.10+.
-* `python3-yaml`, `python3-gi`, GTK 3; `zenity` for approval dialogs.
-* `xapp` or `libayatana-appindicator3` for the tray (falls back to
-  `Gtk.StatusIcon`).
-* Root only for the helper, sudoers rule, systemd unit, and icon.
+- Linux with **systemd**, **NetworkManager**, and **nftables**
+- Python **3.10+**
+- `python3-gi`, `python3-yaml`
+- X11 (`xprop`) for strict-mode focus tracking
+- `zenity` for graphical approval dialogs (a terminal prompt is used otherwise)
+
+On Debian, Ubuntu, or Linux Mint:
+
+```bash
+sudo apt update
+sudo apt install -y \
+    python3 python3-gi python3-yaml \
+    nftables network-manager \
+    x11-utils zenity libnotify-bin rsync
+```
+
+Optional:
+
+```bash
+# Statistics chart
+sudo apt install -y python3-matplotlib
+
+# Native tray backend on desktops that provide XApp
+sudo apt install -y xapp
+```
+
+The tray also supports AppIndicator3 and plain `Gtk.StatusIcon`, so XApp is not
+required.
+
+---
 
 ## Install
+
+### Quick install from the clone
 
 ```bash
 git clone https://github.com/jagdishsah126/Linux-Data-Guardian.git
 cd Linux-Data-Guardian
 
-# 1. User-level: wrapper, config seed, shims, autostart entry, desktop file
-./scripts/install.sh
-
-# 2. System-level: helper, sudoers rule, systemd unit, icon
 sudo ./scripts/install.sh --system
 ```
 
-The user step never asks for a password. The system step installs exactly one
-NOPASSWD command (`/usr/local/libexec/data-guardian-helper`); it does not grant
-general sudo and writes no APT configuration.
+`--system` installs both parts:
 
-Then designate your hotspot and check the installation:
+1. **System:** the root-owned helper, one sudoers rule, the systemd service,
+   and the icon.
+2. **User:** the `data-guardian` wrapper, config seed, CLI shims, tray
+   autostart entry, and desktop entry.
+
+The installer resolves the real desktop user from `SUDO_USER`, so user files do
+not land in `/root`. It does not enable general passwordless sudo and does not
+write an APT hook.
+
+After installation:
 
 ```bash
-data-guardian set-hotspot        # interactive picker
-data-guardian doctor             # full health check
+data-guardian set-hotspot    # choose your metered Wi-Fi network
+data-guardian doctor         # verify the installation
+data-guardian status         # show current state
+```
+
+The daemon starts immediately. The tray starts automatically at your next login.
+To start it now:
+
+```bash
+data-guardian tray &
+```
+
+### Recommended: install from a runtime copy
+
+Use this if you want to keep the source clone separate from the installed app,
+or if you may delete the clone later.
+
+```bash
+git clone https://github.com/jagdishsah126/Linux-Data-Guardian.git
+cd Linux-Data-Guardian
+
+./scripts/deploy.sh "$HOME/linux-data-guardian-runtime"
+
+cd "$HOME/linux-data-guardian-runtime"
+sudo ./scripts/install.sh --system
+```
+
+The runtime copy is self-contained: the service, wrapper, shims, and icon all
+point at it, not at the source clone. You can delete the clone afterwards.
+
+The deploy script writes a `DEPLOYED` file with the source path and commit. It
+also includes `File.md` for offline reading.
+
+### Update
+
+If you installed from a runtime copy:
+
+```bash
+cd /path/to/Linux-Data-Guardian
+git pull
+./scripts/deploy.sh "$HOME/linux-data-guardian-runtime"
+sudo "$HOME/linux-data-guardian-runtime/scripts/install.sh" --system
+```
+
+If you installed directly from the clone:
+
+```bash
+cd /path/to/Linux-Data-Guardian
+git pull
+sudo ./scripts/install.sh --system
+```
+
+Re-running the installer is safe; it is idempotent and does not overwrite an
+existing user config or usage database.
+
+---
+
+## First use
+
+```bash
+# Pick the Wi-Fi network that is your phone hotspot
+data-guardian set-hotspot
+
+# Check everything
+data-guardian doctor
 data-guardian status
 ```
 
-The daemon runs as `data-guardian.service`; the tray starts from the XFCE
-autostart entry on the next login.
+Open the dashboard:
 
-### Deploying a runtime copy
+```bash
+data-guardian dashboard
+```
 
-`scripts/deploy.sh [destination]` rsyncs only `src/`, `scripts/`, `config/`,
-`systemd/`, and `assets/` into a plain artifact directory (default:
-`/home/jagdish/Desktop/System Files/Linux Data Guardian`). It refuses to write
-into a second git clone and records the source commit in `DEPLOYED`.
+The tray menu and dashboard both let you:
+
+- switch between `balanced`, `strict`, and `off`;
+- set the designated hotspot;
+- grant a temporary allowance;
+- open or close the APT window;
+- trigger an emergency bypass;
+- view per-network usage and history.
 
 ---
 
 ## CLI
 
-```
+```text
 data-guardian status [--json]        Connection, profile, counters, quota verdict
 data-guardian daemon                 Run the background daemon (systemd does this)
 data-guardian tray                   Status icon
@@ -122,25 +207,25 @@ data-guardian install-shims          Write pip/pip3/npm/cargo shims
 data-guardian remove-shims           Remove them
 ```
 
-`--version` prints the version. `python3 -m src.data_guardian` is equivalent
-when `PYTHONPATH` points at the project root.
+`python3 -m src.data_guardian` is equivalent when `PYTHONPATH` points at the
+project root.
 
 ---
 
-## Files
+## Configuration
 
-| Path | Purpose |
-| :--- | :--- |
-| `~/.config/linux-data-guardian/config.yaml` | Quotas, profile, designated hotspot |
-| `~/.config/linux-data-guardian/whitelist.yaml` | Strict-mode process/port allowlist |
-| `~/.local/share/linux-data-guardian/guardian.db` | Usage, quota state, notifications, approvals |
-| `/run/data-guardian/` | 0600 Unix socket + instance lock (system service; manual runs use `$XDG_RUNTIME_DIR` or `/run/user/<uid>`) |
-| `/usr/local/libexec/data-guardian-helper` | Privileged firewall/cgroup helper |
-| `/etc/systemd/system/data-guardian.service` | Daemon unit |
+The installer seeds:
 
-All paths honour `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`.
+```text
+~/.config/linux-data-guardian/config.yaml
+~/.config/linux-data-guardian/whitelist.yaml
+```
 
-### Quota configuration
+The defaults live in [`config/config.default.yaml`](config/config.default.yaml)
+and [`config/whitelist.yaml`](config/whitelist.yaml). Missing keys fall back to
+those defaults.
+
+Quota example:
 
 ```yaml
 quotas:
@@ -152,30 +237,139 @@ quotas:
   max_allowance_mb: 10000
 ```
 
-Changing the daily limit updates the stored limit on the next evaluation.
-Allowances never survive into the next day.
+Strict-mode example:
+
+```yaml
+strict_whitelist_processes:
+  - opencode
+  - antigravity
+
+strict_allowed_ports_tcp:
+  - 22
+  - 80
+  - 443
+```
+
+Local data:
+
+| Path | Purpose |
+| :--- | :--- |
+| `~/.config/linux-data-guardian/config.yaml` | Profile, hotspot, quotas |
+| `~/.config/linux-data-guardian/whitelist.yaml` | Strict process/port policy |
+| `~/.local/share/linux-data-guardian/guardian.db` | Usage, quota state, notifications, approvals |
+| `/run/data-guardian/data-guardian.sock` | User-only IPC socket |
+
+All paths honour `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`.
+
+---
+
+## How it works
+
+```text
+systemd
+  └─ data-guardian daemon
+       ├─ NetworkMonitor        libnm / nmcli
+       ├─ InterfaceByteCounter  /proc/net/dev
+       ├─ Database              SQLite WAL, schema v3
+       ├─ Quota engine          metered-only arithmetic
+       ├─ NftablesManager       render rules, call helper
+       │    └─ privileged helper ──► nft
+       └─ IPC socket
+            ├─ tray
+            ├─ dashboard
+            └─ CLI
+```
+
+- **The daemon is the only writer** of firewall state and quota state.
+- **The helper is the only root process.** It accepts a fixed set of actions,
+  validates every ruleset with `nft -c` before applying it, and touches only
+  `table inet data_guardian`.
+- **The UI never blocks on IPC.** Tray and dashboard use worker threads and
+  `GLib.idle_add`.
+- **Statistics and quota are separate.** Usage tables are for display;
+  `quota_state` is the authority for limits, allowances, warnings, and blocks.
+
+See **[File.md](File.md)** for the full file-by-file explanation.
 
 ---
 
 ## Safety and recovery
 
-* All rules live in `table inet data_guardian`; `ufw` and other tables are not
-  modified.
-* Every apply starts with `destroy table` in the same transaction, so retries
+- All firewall rules live in `table inet data_guardian`. `ufw` and other tables
+  are not modified.
+- Every apply starts with `destroy table` in the same transaction, so retries
   and crashes cannot duplicate rules.
-* If the daemon dies, `ExecStopPost` flushes the table. A live daemon keeps its
-  socket; `data-guardian bypass` asks it to flush rather than deleting the
-  socket.
-* `./scripts/emergency-disable.sh` works even if Python is broken: it tries the
-  daemon, then the helper directly.
-
-Uninstall:
+- If the daemon stops, `ExecStopPost` flushes the table.
+- If you are locked out:
 
 ```bash
-./scripts/uninstall.sh            # remove app + system integration, keep data
-./scripts/uninstall.sh --purge    # also delete config and usage history
-sudo ./scripts/uninstall.sh --purge   # when started through sudo
+data-guardian bypass
+# or, if Python is unavailable:
+bash "$(cat ~/.config/linux-data-guardian/project_dir)/scripts/emergency-disable.sh"
+# or directly:
+sudo /usr/local/libexec/data-guardian-helper --flush
 ```
+
+- The helper and sudoers rule can be checked with:
+
+```bash
+sudo -n /usr/local/libexec/data-guardian-helper --status
+sudo visudo -cf /etc/sudoers.d/linux-data-guardian
+```
+
+### Privacy
+
+- No telemetry, account, or remote service.
+- Config and database are readable only by your user.
+- The IPC socket is owner-only.
+- When reporting a bug, **redact** network names, UUIDs, interface names,
+  usernames, file paths, and any part of `config.yaml`, `guardian.db`, or logs
+  that identifies your device or networks.
+
+---
+
+## Troubleshooting
+
+Run this first:
+
+```bash
+data-guardian doctor
+journalctl -u data-guardian.service -n 100 --no-pager
+```
+
+Common cases:
+
+| Symptom | Check |
+| :--- | :--- |
+| Daemon offline | `sudo systemctl restart data-guardian.service` |
+| IPC warning | Confirm `/run/data-guardian/data-guardian.sock` exists and is owned by you. |
+| Firewall error | Confirm the helper is installed and the sudoers rule validates. |
+| Strict blocks too much | Use `balanced`, or verify cgroup v2 and X11 focus tracking. |
+| No tray icon | Install `xapp` or an AppIndicator package, then log out/in or run `data-guardian tray &`. |
+| No approval dialog | Install `zenity`; otherwise the gate uses a terminal prompt. |
+| Chart missing | Install `python3-matplotlib`; the rest of the dashboard still works. |
+| APT still blocked | Open the APT window from the tray/dashboard or run `data-guardian allow-apt`. |
+
+The dashboard's **CLI** tab has shortcuts for many of these checks.
+
+---
+
+## Uninstall
+
+```bash
+./scripts/uninstall.sh            # remove the app, keep config and history
+./scripts/uninstall.sh --purge    # also delete config and usage history
+```
+
+If the installed runtime copy is separate, run its uninstaller:
+
+```bash
+"$HOME/linux-data-guardian-runtime/scripts/uninstall.sh" --purge
+```
+
+The uninstaller stops and disables the service, flushes the firewall table,
+removes the helper, sudoers rule, icon, shims, wrapper, autostart entry, and
+desktop entry. It does not delete the source clone or the runtime directory.
 
 ---
 
@@ -183,12 +377,32 @@ sudo ./scripts/uninstall.sh --purge   # when started through sudo
 
 ```bash
 python3 -m pytest -q        # 130 hermetic tests, no root required
-ruff check src tests        # optional; CI runs it
+ruff check src tests        # optional; CI also runs it
 ```
 
-The test suite covers quota arithmetic, schema v2 → v3 migration, ruleset
-rendering plus real `nft -c` parsing, helper argument validation, IPC
-concurrency, configuration hardening, installer safety, and daemon command
-handlers. See `ImprovePlan.md` for the audit that produced the current design.
+The suite covers quota arithmetic, schema migration, nftables rendering and
+validation, helper argument safety, IPC concurrency, configuration permissions,
+installer safety, and daemon command handlers.
 
-Pull requests run the same suite on Python 3.10 and 3.12 via GitHub Actions.
+Pull requests run the same suite on Python 3.10 and 3.12.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development rules and
+[`SECURITY.md`](SECURITY.md) for the security model and reporting guidance.
+
+---
+
+## Project layout
+
+```text
+src/data_guardian/     application code
+scripts/               installer, uninstaller, helper, deploy
+config/                default config and sudoers template
+systemd/               service and desktop templates
+tests/                 hermetic test suite
+assets/                application icon
+File.md                file-by-file reverse-engineering guide
+README.md              this file
+```
+
+`File.md` is the place to start if you want to understand the code rather than
+just use it.

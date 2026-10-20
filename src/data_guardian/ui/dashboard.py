@@ -187,7 +187,7 @@ CLI_COMMANDS = [
             },
             {
                 "label": "Emergency Disable Script",
-                "cmd": "bash '/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/emergency-disable.sh'",
+                "cmd": "bash \"$(cat \"${XDG_CONFIG_HOME:-$HOME/.config}/linux-data-guardian/project_dir\")/scripts/emergency-disable.sh\"",
                 "desc": "Directly run the emergency disable script to flush all nft data_guardian rules immediately.",
             },
         ],

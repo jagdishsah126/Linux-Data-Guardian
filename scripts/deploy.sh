@@ -2,21 +2,19 @@
 # ==============================================================================
 # Linux Data Guardian — Deploy runtime artifact
 #
-# Copies only the files needed at runtime into the implementation directory.
-# The implementation directory is a plain artifact (no nested git repository),
-# so it can never diverge from the build tree.
+# Copies the runtime files (plus the offline File.md guide) into the
+# implementation directory. The implementation directory is a plain artifact
+# (no nested git repository), so it can never diverge from the build tree.
 # ==============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-DEPLOY_DIR="${1:-/home/jagdish/Desktop/System Files/Linux Data Guardian}"
+DEFAULT_DEPLOY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/linux-data-guardian-runtime"
+DEPLOY_DIR="${1:-$DEFAULT_DEPLOY_DIR}"
 
-if [ ! -d "$DEPLOY_DIR" ]; then
-    echo "[!] Destination does not exist: $DEPLOY_DIR" >&2
-    exit 1
-fi
+mkdir -p "$DEPLOY_DIR"
 
 if [ -d "$DEPLOY_DIR/.git" ]; then
     echo "[!] $DEPLOY_DIR is still a git repository." >&2
@@ -35,6 +33,7 @@ rsync -a --delete --delete-excluded \
     --include '/config/***' \
     --include '/systemd/***' \
     --include '/assets/***' \
+    --include '/File.md' \
     --exclude '*' \
     "${BUILD_ROOT}/" "${DEPLOY_DIR}/"
 

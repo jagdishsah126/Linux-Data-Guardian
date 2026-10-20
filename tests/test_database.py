@@ -59,7 +59,7 @@ class TestDatabase(unittest.TestCase):
             conn.execute("SELECT 1;")
 
     def test_session_lifecycle(self):
-        session_id = self.db.start_session("uuid-1234", "NTC Hotspot", "wlp0s20f3", "balanced")
+        session_id = self.db.start_session("uuid-1234", "Example Hotspot", "wlan0", "balanced")
         self.assertGreater(session_id, 0)
 
         self.db.update_session(session_id, delta_rx=1024, delta_tx=512)
