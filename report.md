@@ -73,12 +73,23 @@ on live data.
   move another process into a delegated cgroup (`Permission denied`), which was
   reproduced directly.
 
-## 5. Pending actions (require the user)
+## 5. Deployment and remaining actions
 
-1. Install/refresh the helper, sudoers rule, systemd unit, and icon:
-   `sudo ./scripts/install.sh --system`.
+Completed:
+
+* Source committed as `13b19ef`, deploy fix as `30490af`, pushed to `origin/main`.
+* The deploy target's `.git` was backed up to
+  `/tmp/opencode/ldg-deploy-git-backup/git-dir.tar.gz` and removed (the target
+  `HEAD` was an ancestor of `main`, and its three modified files were
+  byte-identical to the old build commit).
+* `scripts/deploy.sh` synced the runtime tree; the deployed `DEPLOYED` file
+  records `commit=30490af`. Runtime directories are byte-identical to the build
+  tree, and no caches, docs, `.git`, `apt_hook.py`, or `wifi.png` remain.
+
+Pending (requires the user's sudo password):
+
+1. Install/refresh the helper, sudoers rule, systemd unit, and icon from the
+   deployed tree: `sudo "/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/install.sh" --system`.
 2. Verify cgroup creation and strict-mode application on the live hotspot.
-3. Remove the stale `.git` directory inside the deploy target after backup, then
-   run `./scripts/deploy.sh`.
 
 No `sudo` command in this report was executed automatically.
