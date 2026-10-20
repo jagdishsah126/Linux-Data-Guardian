@@ -117,12 +117,12 @@ class TestDatabaseHardening(IsolatedTestCase):
         """BUG-15: a crash must not leave open sessions forever."""
         session_id = self.db.start_session("uuid", "Name", "wlan0")
         self.assertEqual(self.db.close_orphan_sessions(), 1)
-        with self.db._get_connection() as conn:
+        with self.db._connection() as conn:
             row = conn.execute("SELECT ended_at FROM sessions WHERE id = ?;", (session_id,)).fetchone()
         self.assertIsNotNone(row["ended_at"])
 
     def test_schema_version_is_current(self):
-        with self.db._get_connection() as conn:
+        with self.db._connection() as conn:
             version = conn.execute("SELECT MAX(version) FROM schema_version;").fetchone()[0]
         self.assertEqual(version, 3)
 
@@ -131,7 +131,7 @@ class TestDatabaseHardening(IsolatedTestCase):
         from datetime import date, timedelta
 
         today = date.today()
-        with self.db._get_connection() as conn:
+        with self.db._connection() as conn:
             for offset in (0, 59, 60):
                 day = (today - timedelta(days=offset)).isoformat()
                 conn.execute(

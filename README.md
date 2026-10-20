@@ -134,7 +134,7 @@ when `PYTHONPATH` points at the project root.
 | `~/.config/linux-data-guardian/config.yaml` | Quotas, profile, designated hotspot |
 | `~/.config/linux-data-guardian/whitelist.yaml` | Strict-mode process/port allowlist |
 | `~/.local/share/linux-data-guardian/guardian.db` | Usage, quota state, notifications, approvals |
-| `$XDG_RUNTIME_DIR/data-guardian/` | Instance lock and 0600 Unix socket |
+| `/run/data-guardian/` | 0600 Unix socket + instance lock (system service; manual runs use `$XDG_RUNTIME_DIR` or `/run/user/<uid>`) |
 | `/usr/local/libexec/data-guardian-helper` | Privileged firewall/cgroup helper |
 | `/etc/systemd/system/data-guardian.service` | Daemon unit |
 
@@ -182,7 +182,7 @@ sudo ./scripts/uninstall.sh --purge   # when started through sudo
 ## Development
 
 ```bash
-python3 -m pytest -q        # 124 hermetic tests, no root required
+python3 -m pytest -q        # 130 hermetic tests, no root required
 ruff check src tests        # optional; CI runs it
 ```
 

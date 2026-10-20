@@ -3,7 +3,7 @@
 **Date:** 2026-10-20
 **Build tree:** `/home/jagdish/Desktop/Projects/Zara/Linux Data Guardian`
 **Target:** Linux Mint 22.3 XFCE (X11), Python 3.12, nftables, NetworkManager
-**Status:** source complete and tested; privileged reinstall and deploy pending
+**Status:** source complete and tested; runtime tree deployed; live restart verification pending
 
 This report records what was actually executed and observed. Earlier claims in
 `report.md`, `audit.md`, `plan.md`, and `step.md` were not evidence-based and
@@ -15,7 +15,7 @@ have been replaced or marked historical.
 
 ```text
 $ python3 -m pytest -q
-124 passed in 4.25s
+130 passed in 8.36s
 ```
 
 The suite is hermetic: it uses temporary XDG directories, mocks the privileged
@@ -24,11 +24,11 @@ boundary, and skips checks that need unavailable kernel features. Coverage:
 | Area | Tests | What is asserted |
 | :--- | :--- | :--- |
 | Quota engine | `test_quota.py` | Empty day is free; zero limit is unlimited; metered-only accounting; allowance clears a block; monthly-only plans; warn-only never blocks; thresholds fire once; DB permissions; orphan recovery; schema version |
-| Database | `test_database.py` | Schema v3 tables, session lifecycle, limit/allowance bookkeeping, warning levels, approvals, metered-only monthly totals, frozen metered flag |
+| Database | `test_database.py` | Schema v3 tables, session lifecycle, limit/allowance bookkeeping, warning levels, approvals, metered-only monthly totals, frozen metered flag, file-descriptor closure |
 | Rulesets | `test_firewall_rules.py` | `destroy table` idempotence, profile rendering, APT-window ordering, quota hard cutoff, interface injection rejection, real `nft -c` parse of balanced/blocked/fallback/cgroup rulesets |
 | Helper | `test_firewall_rules.py` | Unknown action, foreign table, `flush ruleset`, `include`, cgroup traversal, invalid PIDs, non-root refusal |
 | Daemon | `test_daemon.py` | Startup quota recovery, allowance/profile/hotspot commands, APT timer open/expire, notification cursors, firewall failure surfacing, socket ownership and single-daemon guard |
-| IPC | `test_daemon.py` | Round trip, 0600 socket, malformed JSON, handler crash recovery, second server refusal |
+| IPC | `test_daemon.py` | Round trip, 0600 socket, malformed JSON, handler crash recovery, second server refusal, systemd/XDG/tmp runtime-directory selection |
 | Network | `test_network.py` | Escaped-colon `nmcli` parsing, UUID/name matching, transition callbacks, byte-counter resets, virtual-interface exclusion |
 | Config | `test_config.py` | XDG paths, defaults, secure writes, per-network profiles, whitelist values |
 | Approvals | `test_approvals.py` | `pip install`/`-m pip` gating, flags with values, read-only pass-through, timeout policy, shim install/remove |
@@ -59,8 +59,13 @@ on live data.
   GTK caches warm. The earlier `< 35 MB` claim was false.
 * The runtime database is `~/.local/share/linux-data-guardian/guardian.db`
   (0600) in WAL mode.
-* The Unix socket is created under the XDG runtime directory with mode 0600.
+* The Unix socket is created under the systemd runtime directory
+  (`/run/data-guardian/data-guardian.sock`) with mode 0600.
 * A second daemon refuses to start (flock + live-socket probe).
+* The first live reinstall exposed two bugs that the suite did not cover:
+  the daemon and CLI met at different socket paths (BUG-61), and every SQLite
+  query leaked a file descriptor (BUG-62, 76 open descriptors after 5 minutes).
+  Both are fixed in source and covered by regressions; see `ImprovePlan.md` §2a.
 
 ## 4. Privileged boundary
 
@@ -77,7 +82,8 @@ on live data.
 
 Completed:
 
-* Source committed as `13b19ef`, deploy fix as `30490af`, pushed to `origin/main`.
+* Source committed as `13b19ef`, deploy fix as `30490af`, audit completion as
+  `4bc3300`, and the BUG-61/BUG-62 fixes as the latest commit on `main`.
 * The deploy target's `.git` was backed up to
   `/tmp/opencode/ldg-deploy-git-backup/git-dir.tar.gz` and removed (the target
   `HEAD` was an ancestor of `main`, and its three modified files were
@@ -88,8 +94,11 @@ Completed:
 
 Pending (requires the user's sudo password):
 
-1. Install/refresh the helper, sudoers rule, systemd unit, and icon from the
-   deployed tree: `sudo "/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/install.sh" --system`.
-2. Verify cgroup creation and strict-mode application on the live hotspot.
+1. Re-run the system installer from the deployed tree so the unit gains
+   `RuntimeDirectory=data-guardian` and the daemon starts with the fixed code:
+   `sudo "/home/jagdish/Desktop/System Files/Linux Data Guardian/scripts/install.sh" --system`.
+2. Run `data-guardian doctor` and `data-guardian status`; confirm IPC is
+   reachable at `/run/data-guardian/data-guardian.sock`.
+3. Verify cgroup creation and strict-mode application on the live hotspot.
 
 No `sudo` command in this report was executed automatically.

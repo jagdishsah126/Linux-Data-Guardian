@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -13,17 +14,61 @@ MAX_REQUEST_BYTES = 65536
 MAX_RESPONSE_BYTES = 262144
 PROTOCOL_VERSION = 2
 
+# systemd's system manager expands ``%U`` to 0 in a system unit, even when the
+# unit runs with ``User=``.  Never trust an XDG_RUNTIME_DIR that belongs to a
+# different user (or to root): fall back to the per-user runtime directory.
+#
+# The installed unit also creates /run/data-guardian via RuntimeDirectory=.
+# That path exists before login (when /run/user/<uid> does not yet exist) and is
+# chowned to User=, so it is the rendezvous point for the daemon and its CLI.
+SYSTEM_RUNTIME_DIR = Path("/run/data-guardian")
+USER_RUNTIME_ROOT = Path("/run/user")
+
+
+def _is_private_dir(path: Path) -> bool:
+    """True when *path* is a real directory owned by the current user.
+
+    ``lstat`` deliberately rejects symlinks: a shared /tmp entry must not be
+    able to redirect the daemon's lock or socket into another directory.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+
 
 def get_runtime_dir() -> Path:
-    """Runtime directory for sockets and lock files (0700)."""
+    """Runtime directory for sockets and lock files (0700).
+
+    The daemon is a system service, so its XDG_RUNTIME_DIR may be unset or point
+    at root's ``/run/user/0``.  UI clients run inside the desktop session and
+    use ``/run/user/<uid>``.  Prefer the user's real runtime directory so both
+    sides always meet at the same socket path.
+    """
+    # The systemd unit sets RUNTIME_DIRECTORY for the daemon. Clients do not
+    # inherit it, so both sides also check the fixed RuntimeDirectory path.
+    for entry in os.environ.get("RUNTIME_DIRECTORY", "").split(":"):
+        if entry and _is_private_dir(Path(entry)):
+            return Path(entry)
+    if _is_private_dir(SYSTEM_RUNTIME_DIR):
+        return SYSTEM_RUNTIME_DIR
+
     runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime and Path(runtime).is_dir():
-        return Path(runtime)
+    if runtime:
+        candidate = Path(runtime)
+        if _is_private_dir(candidate):
+            return candidate
+
+    user_runtime = USER_RUNTIME_ROOT / str(os.getuid())
+    if _is_private_dir(user_runtime):
+        return user_runtime
+
     fallback = Path("/tmp") / f"data-guardian-{os.getuid()}"
     fallback.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Refuse a pre-created directory owned by somebody else (symlink/ownership
     # attack on a shared /tmp).
-    if fallback.stat().st_uid != os.getuid():
+    if not _is_private_dir(fallback):
         raise RuntimeError(f"runtime directory {fallback} is not owned by this user")
     try:
         os.chmod(fallback, 0o700)

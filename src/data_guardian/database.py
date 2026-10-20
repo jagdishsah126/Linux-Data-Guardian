@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 CURRENT_SCHEMA_VERSION = 3
 
@@ -52,7 +53,7 @@ class Database:
         # The WAL/SHM files are created lazily by SQLite; force a connection so
         # they exist now and can be tightened.
         try:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 conn.execute("PRAGMA user_version;")
             for suffix in ("", "-wal", "-shm"):
                 candidate = Path(f"{self.db_path}{suffix}")
@@ -70,11 +71,27 @@ class Database:
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Transactional connection that is always closed.
+
+        ``sqlite3.Connection.__exit__`` commits or rolls back, but it does *not*
+        close the connection.  Every short-lived database operation must use
+        this wrapper, otherwise each poll leaks a file descriptor until the
+        daemon exhausts its limit.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     # --- schema --------------------------------------------------------------
 
     def _init_db(self) -> None:
         """Create tables and indexes if they do not exist."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
 
             cursor.execute("""
@@ -179,7 +196,7 @@ class Database:
 
     def _migrate(self) -> None:
         """Apply schema migrations for version upgrades."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT MAX(version) FROM schema_version;")
             row = cursor.fetchone()
@@ -291,7 +308,7 @@ class Database:
         profile: str = "balanced",
     ) -> int:
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO sessions
@@ -302,7 +319,7 @@ class Database:
             return cursor.lastrowid or 0
 
     def update_session(self, session_id: int, delta_rx: int, delta_tx: int) -> None:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             conn.execute("""
                 UPDATE sessions
                 SET rx_bytes = rx_bytes + ?,
@@ -314,7 +331,7 @@ class Database:
 
     def end_session(self, session_id: int) -> None:
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, last_update = ? WHERE id = ?;",
                 (now, now, session_id),
@@ -324,7 +341,7 @@ class Database:
     def close_orphan_sessions(self) -> int:
         """Close sessions left open by an unclean shutdown. Returns rows affected."""
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.execute("""
                 UPDATE sessions
                 SET ended_at = COALESCE(last_update, started_at)
@@ -355,7 +372,7 @@ class Database:
         day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
 
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
 
             cursor.execute("""
@@ -394,7 +411,7 @@ class Database:
     def get_today_usage(self, target_date: Optional[str] = None) -> Dict[str, Any]:
         """Combined statistics for the day plus authoritative quota bookkeeping."""
         day = target_date or date.today().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM daily_usage WHERE date = ?;", (day,))
             row = cur.fetchone()
@@ -428,7 +445,7 @@ class Database:
         self, connection_uuid: str, target_date: Optional[str] = None
     ) -> Dict[str, Any]:
         day = target_date or date.today().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT * FROM network_daily_usage WHERE date = ? AND connection_uuid = ?;",
@@ -459,7 +476,7 @@ class Database:
     def get_quota_state(self, target_date: Optional[str] = None) -> Dict[str, Any]:
         day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             self._ensure_quota_row(cursor, day, now)
             conn.commit()
@@ -475,7 +492,7 @@ class Database:
             raise ValueError("allowance_bytes must be positive")
         day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             self._ensure_quota_row(cursor, day, now)
             cursor.execute("""
@@ -493,7 +510,7 @@ class Database:
         """Record that a warning threshold fired. Returns True if newly recorded."""
         day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             self._ensure_quota_row(cursor, day, now)
             cursor.execute("SELECT warnings_fired FROM quota_state WHERE date = ?;", (day,))
@@ -514,7 +531,7 @@ class Database:
     ) -> None:
         day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             self._ensure_quota_row(cursor, day, now)
             cursor.execute(
@@ -527,7 +544,7 @@ class Database:
         """Store the configured daily limit for the day (0 means unlimited)."""
         day = target_date or date.today().isoformat()
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
             self._ensure_quota_row(cursor, day, now)
             cursor.execute(
@@ -541,7 +558,7 @@ class Database:
 
     def metered_total(self, target_date: Optional[str] = None) -> int:
         day = target_date or date.today().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total
@@ -559,7 +576,7 @@ class Database:
             start = today.replace(day=cycle_day)
         else:
             start = (today.replace(day=1) - timedelta(days=1)).replace(day=cycle_day)
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total
@@ -593,7 +610,7 @@ class Database:
             sql += " AND connection_uuid = ?"
             params.append(connection_uuid)
 
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(sql + ";", params)
             row = cur.fetchone()
@@ -610,7 +627,7 @@ class Database:
 
     def get_all_networks_history(self, days: int = 60) -> Dict[str, List[Dict[str, Any]]]:
         """Per-network daily history for the last ``days`` days (inclusive of today)."""
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 SELECT date, connection_uuid, connection_name,
@@ -634,7 +651,7 @@ class Database:
         return result
 
     def get_known_networks(self) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 SELECT connection_uuid, connection_name,
@@ -649,7 +666,7 @@ class Database:
     # --- notifications ---------------------------------------------------------
 
     def add_notification(self, title: str, message: str, urgency: str = "normal") -> int:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO notifications (ts, title, message, urgency) VALUES (?, ?, ?, ?);",
@@ -659,14 +676,14 @@ class Database:
             return cur.lastrowid or 0
 
     def latest_notification_id(self) -> int:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT COALESCE(MAX(id), 0) AS m FROM notifications;")
             row = cur.fetchone()
             return int(row["m"]) if row else 0
 
     def get_notifications_since(self, since_id: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT * FROM notifications WHERE id > ? ORDER BY id ASC LIMIT ?;",
@@ -675,7 +692,7 @@ class Database:
             return [dict(r) for r in cur.fetchall()]
 
     def prune_notifications(self, keep_hours: int = 24) -> int:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "DELETE FROM notifications WHERE ts < datetime('now', ?);",
@@ -691,7 +708,7 @@ class Database:
         if retention_days <= 0:
             return 0
         cutoff = (date.today() - timedelta(days=retention_days)).isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM network_daily_usage WHERE date < ?;", (cutoff,))
             removed = cur.rowcount or 0
@@ -702,7 +719,7 @@ class Database:
             return removed
 
     def checkpoint(self) -> None:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
 
     # --- approval events -------------------------------------------------------
@@ -711,7 +728,7 @@ class Database:
         self, tool: str, packages: str, estimated_bytes: int, decision: str
     ) -> int:
         now = datetime.now().isoformat()
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO approval_events (timestamp, tool, packages, estimated_bytes, decision, resolved_at)
@@ -721,7 +738,7 @@ class Database:
             return cur.lastrowid or 0
 
     def get_recent_approvals(self, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM approval_events ORDER BY id DESC LIMIT ?;", (limit,))
             return [dict(row) for row in cur.fetchall()]

@@ -1,8 +1,9 @@
 # Linux Data Guardian — Verified Audit & Bug-Free Improvement Plan
 
-**Status:** implementation complete; 124 tests passing. The bug registry in §2
-is the *pre-fix* record and is kept as the audit trail. Remaining privileged
-install and deploy steps are listed in §9. See `report.md` for verified results.
+**Status:** implementation complete; 130 tests passing. The bug registry in §2
+is the *pre-fix* record and is kept as the audit trail; post-audit regressions
+(BUG-61 and BUG-62) are recorded in §2a. Remaining privileged install and deploy
+steps are listed in §9. See `report.md` for verified results.
 **Scope:** every tracked file in the build workspace, every claim in `README.md`, `audit.md`, `plan.md`, `step.md`, `report.md`, and the live installed system.
 **Method:** static reading of all 4,672 LOC + live runtime probing (daemon, IPC, DB, helper, nft, UI, systemd, installer) — not test-suite-only.
 
@@ -340,7 +341,7 @@ install -m 0644 assets/icon.png /usr/share/icons/hicolor/512x512/apps/linux-data
 install -m 0644 systemd/data-guardian.desktop "$TARGET_HOME/.local/share/applications/"
 ```
 
-Template the unit (`User=`, `HOME=`, `XDG_RUNTIME_DIR=/run/user/%U`) instead of shipping `jagdish` paths.
+Template the unit (`User=`, `HOME=`) instead of shipping `jagdish` paths. Do **not** set `XDG_RUNTIME_DIR=/run/user/%U` in a system unit: `%U` expands to `0`, so the daemon and the desktop client would use different sockets. Use `RuntimeDirectory=data-guardian` with `RuntimeDirectoryMode=0700` instead; both sides meet at `/run/data-guardian` (BUG-61).
 
 #### BUG-21 · `rulesets.py` is dead code and its strict profile fails `nft -c`
 
@@ -464,6 +465,31 @@ and **reword the docs**: "Strict = web/SSH/DNS only; background updaters blocked
 | BUG-58 | No CI | add GitHub Actions (cloud builds are free and avoid metered downloads locally) |
 | BUG-59 | Deploy repo has skip-worktree'd missing files | see §7 |
 | BUG-60 | `assets/wifi.png` is byte-identical to `icon.png` | delete |
+
+---
+
+## 2a. Post-audit regressions (live reinstall verification)
+
+These were found only after the first privileged reinstall, while checking the
+installed daemon rather than the test suite.
+
+#### BUG-61 · Daemon and CLI use different IPC socket paths
+
+**Symptom:** `data-guardian doctor` reports `PID ... running but IPC unresponsive at /run/user/1000/data-guardian.sock`, while `systemctl status` shows the service active. `data-guardian status` reports `Daemon: OFFLINE`.
+
+**Evidence:** the installed unit sets `XDG_RUNTIME_DIR=/run/user/%U`; in a system unit `%U` expands to `0`. `/run/user/0` does not exist for this desktop session, so the daemon fell back to `/tmp/data-guardian-1000/data-guardian.sock`. The CLI runs inside the session with `XDG_RUNTIME_DIR=/run/user/1000`.
+
+**Root cause:** `get_runtime_dir()` trusted any existing `XDG_RUNTIME_DIR` directory without checking that it belongs to the daemon's UID, and the unit assumed `%U` expands to the service user.
+
+**Fix:** give the system service a boot-safe, user-owned runtime directory with `RuntimeDirectory=data-guardian` / `RuntimeDirectoryMode=0700` in the unit. Both daemon (`RUNTIME_DIRECTORY`) and CLI (fixed `/run/data-guardian`) check that path first, so they meet even before `/run/user/<uid>` exists. If it is absent (manual run), accept `XDG_RUNTIME_DIR` only when it is a directory owned by the current UID; otherwise prefer `/run/user/<uid>`; only then fall back to a strictly owned `0700` directory under `/tmp`. Remove `XDG_RUNTIME_DIR` from the system unit and document why. Regression tests cover the systemd path, root-owned env paths, per-user runtime selection, and the `/tmp` fallback.
+
+#### BUG-62 · Every database query leaked a file descriptor
+
+**Symptom:** after five minutes the daemon held 76 open descriptors, most of them SQLite database and WAL handles. A long-running daemon would eventually hit `EMFILE` and stop enforcing quotas.
+
+**Root cause:** all database methods used `with self._get_connection() as conn:`. `sqlite3.Connection.__exit__` commits or rolls back, but it does **not** close the connection. A new connection was opened for every query and left for the garbage collector.
+
+**Fix:** add a `_connection()` context manager that wraps the transaction and always calls `conn.close()` in `finally`; route all 28 call sites through it. A regression test performs 120 queries and asserts that the process file-descriptor count does not grow, and another asserts the connection is unusable after the context exits.
 
 ---
 

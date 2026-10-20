@@ -21,7 +21,7 @@ class TestDatabase(unittest.TestCase):
 
     def test_schema_initialization(self):
         self.assertTrue(self.db_path.exists())
-        with self.db._get_connection() as conn:
+        with self.db._connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT MAX(version) FROM schema_version;")
             self.assertEqual(cursor.fetchone()[0], CURRENT_SCHEMA_VERSION)
@@ -39,12 +39,31 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(self.db_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.db_path.parent.stat().st_mode & 0o777, 0o700)
 
+    def test_short_lived_connections_are_closed(self):
+        """Every query must close its SQLite handle (fd exhaustion regression)."""
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("/proc is not available")
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(60):
+            self.db.get_today_usage()
+            self.db.latest_notification_id()
+        after = len(os.listdir("/proc/self/fd"))
+        self.assertLessEqual(after, before + 5, f"fd count grew from {before} to {after}")
+
+    def test_connection_is_closed_at_context_exit(self):
+        import sqlite3
+
+        with self.db._connection() as conn:
+            conn.execute("SELECT 1;")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1;")
+
     def test_session_lifecycle(self):
         session_id = self.db.start_session("uuid-1234", "NTC Hotspot", "wlp0s20f3", "balanced")
         self.assertGreater(session_id, 0)
 
         self.db.update_session(session_id, delta_rx=1024, delta_tx=512)
-        with self.db._get_connection() as conn:
+        with self.db._connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT rx_bytes, tx_bytes, ended_at FROM sessions WHERE id = ?;",
@@ -56,7 +75,7 @@ class TestDatabase(unittest.TestCase):
             self.assertIsNone(row["ended_at"])
 
         self.db.end_session(session_id)
-        with self.db._get_connection() as conn:
+        with self.db._connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT ended_at FROM sessions WHERE id = ?;", (session_id,))
             self.assertIsNotNone(cursor.fetchone()["ended_at"])

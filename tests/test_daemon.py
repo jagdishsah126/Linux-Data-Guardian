@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from src.data_guardian.daemon import APT_WINDOW_SECONDS, DataGuardianDaemon
-from src.data_guardian.ipc import IpcServer, get_socket_path, send_ipc_command
+from src.data_guardian.ipc import IpcServer, get_runtime_dir, get_socket_path, send_ipc_command
 from tests.support import MB, IsolatedTestCase
 
 
@@ -222,6 +222,48 @@ class TestFirewallFailure(DaemonHarness):
         self.assertFalse(ok)
         self.assertEqual(daemon._firewall_error, "nft exploded")
         self.assertTrue(daemon._snapshot.get("firewall_error"))
+
+
+class TestRuntimeDirectory(unittest.TestCase):
+    """The daemon is a system service; clients run inside the desktop session."""
+
+    def test_systemd_runtime_directory_is_preferred(self):
+        """RuntimeDirectory= exists at boot, before /run/user/<uid> is created."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "data-guardian"
+            runtime.mkdir(mode=0o700)
+            with patch.dict(os.environ, {"RUNTIME_DIRECTORY": str(runtime)}):
+                self.assertEqual(get_runtime_dir(), runtime)
+
+    def test_owned_xdg_runtime_dir_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": tmp, "RUNTIME_DIRECTORY": ""}):
+                with patch("src.data_guardian.ipc.SYSTEM_RUNTIME_DIR", Path(tmp) / "missing"):
+                    self.assertEqual(get_runtime_dir(), Path(tmp))
+
+    def test_root_owned_runtime_dir_is_ignored(self):
+        """systemd expands %U to 0 for a system unit; do not bind under /run/user/0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir = root / str(os.getuid())
+            user_dir.mkdir(mode=0o700)
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(root / "0"),
+                                         "RUNTIME_DIRECTORY": ""}):
+                with patch("src.data_guardian.ipc.USER_RUNTIME_ROOT", root):
+                    with patch("src.data_guardian.ipc.SYSTEM_RUNTIME_DIR", root / "missing"):
+                        self.assertEqual(get_runtime_dir(), user_dir)
+
+    def test_private_tmp_fallback_is_used_when_no_runtime_dir_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(root / "missing"),
+                                         "RUNTIME_DIRECTORY": ""}):
+                with patch("src.data_guardian.ipc.USER_RUNTIME_ROOT", root):
+                    with patch("src.data_guardian.ipc.SYSTEM_RUNTIME_DIR", root / "missing"):
+                        result = get_runtime_dir()
+        self.assertEqual(result, Path("/tmp") / f"data-guardian-{os.getuid()}")
+        self.assertEqual(result.stat().st_uid, os.getuid())
+        self.assertEqual(result.stat().st_mode & 0o777, 0o700)
 
 
 class TestIpcServer(unittest.TestCase):

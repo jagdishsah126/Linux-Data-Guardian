@@ -19,7 +19,7 @@ as a record; the current, evidence-based sequence lives in `ImprovePlan.md`.
    X11 focus reporting.
 8. Installer/uninstaller/deploy scripts with `SUDO_USER`, `visudo -cf`, secure
    paths, and `--purge`.
-9. Hermetic test suite (124 tests) replacing environment-coupled duplicates.
+9. Hermetic test suite (130 tests) replacing environment-coupled duplicates.
 10. Documentation truth pass; memory and capability claims corrected.
 
 ## Still requiring a human with sudo

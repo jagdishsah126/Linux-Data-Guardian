@@ -14,7 +14,11 @@ Environment="PYTHONPATH=@PROJECT_DIR@"
 Environment="HOME=@HOME@"
 Environment="XDG_CONFIG_HOME=@HOME@/.config"
 Environment="XDG_DATA_HOME=@HOME@/.local/share"
-Environment="XDG_RUNTIME_DIR=/run/user/%U"
+# XDG_RUNTIME_DIR is intentionally not set: %U expands to 0 in a system unit.
+# RuntimeDirectory= below gives both the boot-time daemon and the desktop CLI a
+# stable, user-owned rendezvous point before /run/user/<uid> exists.
+RuntimeDirectory=data-guardian
+RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/python3 -m src.data_guardian.main daemon
 ExecStopPost=-/usr/local/libexec/data-guardian-helper --flush
 Restart=on-failure
