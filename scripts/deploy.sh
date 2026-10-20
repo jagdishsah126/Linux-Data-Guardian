@@ -29,7 +29,7 @@ command -v rsync >/dev/null 2>&1 || { echo "[!] rsync is required." >&2; exit 1;
 
 echo "[*] Deploying ${BUILD_ROOT} -> ${DEPLOY_DIR}"
 
-rsync -a --delete \
+rsync -a --delete --delete-excluded \
     --include '/src/***' \
     --include '/scripts/***' \
     --include '/config/***' \
