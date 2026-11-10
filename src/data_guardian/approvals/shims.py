@@ -120,7 +120,11 @@ def install_shims(
 def remove_shims(
     target_dir: Path | None = None, config_dir: Path | None = None
 ) -> List[Path]:
-    """Remove our shims; leave anything else in the directory untouched."""
+    """Remove our shims; leave anything else in the directory untouched.
+
+    The ``project_dir`` marker is intentionally kept: the dashboard's CLI
+    section resolves script paths through it, independent of the shims.
+    """
     dest = target_dir or (Path.home() / ".local" / "bin")
     removed: List[Path] = []
     for tool in SUPPORTED_TOOLS:
@@ -137,8 +141,4 @@ def remove_shims(
                 removed.append(shim_path)
             except OSError as exc:
                 print(f"[!] Warning removing shim {shim_path}: {exc}")
-    try:
-        ((config_dir or default_config_dir()) / PROJECT_MARKER).unlink(missing_ok=True)
-    except OSError:
-        pass
     return removed
